@@ -1,18 +1,22 @@
 from tqdm.auto import trange
 import autograd.numpy as np
 from sklearn.decomposition import PCA
+import torch
 
 def pca_with_imputation(D, datas, masks, num_iters=20):
-    datas = [datas] if not isinstance(datas, (list, tuple)) else datas
-    if masks is not None:
-        masks = [masks] if not isinstance(masks, (list, tuple)) else masks
-        assert np.all([m.shape == d.shape for d, m in zip(datas, masks)])
-    else:
-        masks = [np.ones_like(data, dtype=bool) for data in datas]
+    # datas = [datas] if not isinstance(datas, (list, tuple)) else datas
+    # if masks is not None:
+    #     masks = [masks] if not isinstance(masks, (list, tuple)) else masks
+    #     assert np.all([m.shape == d.shape for d, m in zip(datas, masks)])
+    # else:
+    #     masks = [np.ones_like(data, dtype=bool) for data in datas]
 
-    # Flatten the data and masks
-    data = np.concatenate(datas)
-    mask = np.concatenate(masks)
+    # # Flatten the data and masks
+    # data = np.concatenate(datas)
+    # mask = np.concatenate(masks)
+
+    data = datas.reshape(-1, datas.shape[2]).cpu().numpy()
+    mask = masks.reshape(-1, masks.shape[2]).cpu().numpy()
 
     if np.any(~mask):
         # Fill in missing data with mean to start
@@ -109,19 +113,42 @@ def interpolate_data(data, mask):
     """
     Interpolate over missing entries
     """
-    assert data.shape == mask.shape and mask.dtype == bool
+    assert data.shape == mask.shape and mask.dtype == torch.bool
     T, N = data.shape
-    interp_data = data.copy()
-    if np.any(~mask):
+    interp_data = data.clone()
+    if torch.any(~mask):
         for n in range(N):
-            if np.sum(mask[:,n]) >= 2:
-                t_missing = np.arange(T)[~mask[:,n]]
-                t_given = np.arange(T)[mask[:,n]]
-                y_given = data[mask[:,n], n]
-                interp_data[~mask[:,n], n] = np.interp(t_missing, t_given, y_given)
+            if torch.sum(mask[:,n]) >= 2:
+                t_missing = np.arange(T)[~mask[:,n].cpu().numpy()]
+                t_given = np.arange(T)[mask[:,n].cpu().numpy()]
+                y_given = data[mask[:,n], n].cpu().numpy()
+                interp_data[~mask[:,n], n] = torch.tensor(np.interp(t_missing, t_given, y_given), device=data.device)
             else:
                 # Can't do much if we don't see anything... just set it to zero
                 interp_data[~mask[:,n], n] = 0
+    return interp_data
+
+
+def interpolate_data_3d(data, mask):
+    """
+    Interpolate over missing entries
+    """
+    assert data.shape == mask.shape and mask.dtype == torch.bool
+    B, T, N = data.shape
+    interp_data = data.clone()
+    if torch.any(~mask):
+        for b in range(B):
+            for n in range(N):
+                if not torch.any(~mask[b,:,n]):
+                    continue
+                if torch.sum(mask[b,:,n]) >= 2:
+                    t_missing = np.arange(T)[~mask[b,:,n].cpu().numpy()]
+                    t_given = np.arange(T)[mask[b,:,n].cpu().numpy()]
+                    y_given = data[b,mask[b,:,n], n].cpu().numpy()
+                    interp_data[b,~mask[b,:,n], n] = torch.tensor(np.interp(t_missing, t_given, y_given), dtype=data.dtype, device=data.device)
+                else:
+                    # Can't do much if we don't see anything... just set it to zero
+                    interp_data[b,~mask[b,:,n], n] = 0
     return interp_data
 
 

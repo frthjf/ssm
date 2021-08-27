@@ -9,10 +9,12 @@ from autograd import grad
 
 from ssm.util import ensure_args_are_lists
 
+import torch
+
 class InitialStateDistribution(object):
     def __init__(self, K, D, M=0):
         self.K, self.D, self.M = K, D, M
-        self.log_pi0 = -np.log(K) * np.ones(K)
+        self.log_pi0 = torch.tensor(-np.log(K) * np.ones(K))
 
     @property
     def params(self):
@@ -24,11 +26,17 @@ class InitialStateDistribution(object):
 
     @property
     def initial_state_distn(self):
-        return np.exp(self.log_pi0 - logsumexp(self.log_pi0))
+        # return np.exp(self.log_pi0 - logsumexp(self.log_pi0))
+        # return torch.exp(self.log_pi0 - torch.logsumexp(self.log_pi0, dim=0))
+        temp = torch.exp(self.log_pi0 - torch.logsumexp(self.log_pi0, dim=0))
+        if not torch.all(torch.isfinite(temp)):
+            import pdb; pdb.set_trace()
+        return temp
 
     @property
     def log_initial_state_distn(self):
-        return self.log_pi0 - logsumexp(self.log_pi0)
+        # return self.log_pi0 - logsumexp(self.log_pi0)
+        return self.log_pi0 - torch.logsumexp(self.log_pi0, dim=0)
 
     @ensure_args_are_lists
     def initialize(self, datas, inputs=None, masks=None, tags=None):
@@ -44,8 +52,10 @@ class InitialStateDistribution(object):
         return 0
 
     def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
-        pi0 = sum([Ez[0] for Ez, _, _ in expectations]) + 1e-8
-        self.log_pi0 = np.log(pi0 / pi0.sum())
+        pi0 = torch.sum(expectations[0][:, 0], axis=0) + 1e-8 # sum([Ez[0] for Ez, _, _ in expectations]) + 1e-8
+        self.log_pi0 = torch.log(pi0 / torch.sum(pi0))
+        # if not torch.all(torch.isfinite(self.log_pi0)):
+        # import pdb; pdb.set_trace()
 
 
 class FixedInitialStateDistribution(InitialStateDistribution):

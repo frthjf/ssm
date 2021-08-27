@@ -12,6 +12,7 @@ from ssm.regression import fit_multiclass_logistic_regression, fit_negative_bino
 from ssm.stats import multivariate_normal_logpdf
 from ssm.optimizers import adam, bfgs, lbfgs, rmsprop, sgd
 
+import torch
 
 class Transitions(object):
     def __init__(self, K, D, M=0):
@@ -40,6 +41,13 @@ class Transitions(object):
 
     def transition_matrices(self, data, input, mask, tag):
         return np.exp(self.log_transition_matrices(data, input, mask, tag))
+    
+    def transition_matrices_3d(self, datas, inputs, masks, tags):
+        if "log_transition_matrices_3d" not in dir(self):
+            raise NotImplementedError
+        else:
+            tm = torch.exp(self.log_transition_matrices_3d(datas, inputs, masks, tags))
+            return tm
 
     def m_step(self, expectations, datas, inputs, masks, tags,
                optimizer="lbfgs", num_iters=1000, **kwargs):
@@ -56,14 +64,23 @@ class Transitions(object):
                 log_Ps = self.log_transition_matrices(data, input, mask, tag)
                 elbo += np.sum(expected_joints * log_Ps)
             return elbo
+        
+        def _expected_log_joint_3d(expectations):
+            elbo = self.log_prior()
+            if "log_transition_matrices_3d" not in dir(self):
+                raise NotImplementedError
+            log_Ps = self.log_transition_matrices_3d(datas, inputs, masks, tags)
+            elbo += torch.sum(expectations[1] * log_Ps)
+            return elbo
 
         # Normalize and negate for minimization
         T = sum([data.shape[0] for data in datas])
         def _objective(params, itr):
             self.params = params
-            obj = _expected_log_joint(expectations)
+            # obj = _expected_log_joint(expectations)
+            obj = _expected_log_joint_3d(expectations)
             return -obj / T
-
+        
         # Call the optimizer. Persist state (e.g. SGD momentum) across calls to m_step.
         optimizer_state = self.optimizer_state if hasattr(self, "optimizer_state") else None
         self.params, self.optimizer_state = \
@@ -88,7 +105,7 @@ class StationaryTransitions(Transitions):
         super(StationaryTransitions, self).__init__(K, D, M=M)
         Ps = .95 * np.eye(K) + .05 * npr.rand(K, K)
         Ps /= Ps.sum(axis=1, keepdims=True)
-        self.log_Ps = np.log(Ps)
+        self.log_Ps = torch.tensor(np.log(Ps))
 
     @property
     def params(self):
@@ -106,26 +123,43 @@ class StationaryTransitions(Transitions):
 
     @property
     def transition_matrix(self):
-        return np.exp(self.log_Ps - logsumexp(self.log_Ps, axis=1, keepdims=True))
+        # return np.exp(self.log_Ps - logsumexp(self.log_Ps, axis=1, keepdims=True))
+        return torch.exp(self.log_Ps - torch.logsumexp(self.log_Ps, dim=1, keepdim=True))
 
     def log_transition_matrices(self, data, input, mask, tag):
         log_Ps = self.log_Ps - logsumexp(self.log_Ps, axis=1, keepdims=True)
         return log_Ps[None, :, :]
 
+    def log_transition_matrices_3d(self, datas, inputs, masks, tags):
+        B, T, D = datas.shape
+        # log_Ps = self.log_Ps - logsumexp(self.log_Ps, axis=1, keepdims=True)
+        # return torch.tensor(np.tile(log_Ps[None, :, :], (B, 1, 1, 1)), device=datas.device)
+        log_Ps = self.log_Ps - torch.logsumexp(self.log_Ps, dim=1, keepdim=True)
+        return log_Ps[None, None, :, :].repeat(B, 1, 1, 1)
+
     def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
         K = self.K
-        P = sum([np.sum(Ezzp1, axis=0) for _, Ezzp1, _ in expectations]) + 1e-32
-        P = np.nan_to_num(P / P.sum(axis=-1, keepdims=True))
+        # P = sum([np.sum(Ezzp1, axis=0) for _, Ezzp1, _ in expectations]) + 1e-32
+        # P = np.nan_to_num(P / P.sum(axis=-1, keepdims=True))
 
-        # Set rows that are all zero to uniform
-        P = np.where(P.sum(axis=-1, keepdims=True) == 0, 1.0 / K, P)
-        log_P = np.log(P)
-        self.log_Ps = log_P - logsumexp(log_P, axis=-1, keepdims=True)
+        # # Set rows that are all zero to uniform
+        # P = np.where(P.sum(axis=-1, keepdims=True) == 0, 1.0 / K, P)
+        # log_P = np.log(P)
+        # self.log_Ps = log_P - logsumexp(log_P, axis=-1, keepdims=True)
+        P = torch.sum(expectations[1], dim=[0,1]) + 1e-32
+        P = P / torch.where(torch.sum(P, dim=-1, keepdims=True) == 0, 1.0, torch.sum(P, dim=-1, keepdims=True))
+        P = torch.where(torch.sum(P, dim=-1, keepdims=True) == 0, 1.0 / K, P)
+        log_P = torch.log(P)
+        self.log_Ps = log_P - torch.logsumexp(log_P, axis=-1, keepdims=True)
 
     def neg_hessian_expected_log_trans_prob(self, data, input, mask, tag, expected_joints):
         # Return (T-1, D, D) array of blocks for the diagonal of the Hessian
         T, D = data.shape
         return np.zeros((T-1, D, D))
+
+    def neg_hessian_expected_log_trans_prob_3d(self, datas, inputs, masks, tags, expected_joints):
+        B, T, D = datas.shape
+        return torch.zeros((B, T-1, D, D), device=datas.device)
 
 
 class ConstrainedStationaryTransitions(StationaryTransitions):
@@ -188,14 +222,24 @@ class StickyTransitions(StationaryTransitions):
         self.alpha = alpha
         self.kappa = kappa
 
+    # def log_prior(self):
+    #     K = self.K
+    #     log_P = self.log_Ps - logsumexp(self.log_Ps, axis=1, keepdims=True)
+
+    #     lp = 0
+    #     for k in range(K):
+    #         alpha = self.alpha * np.ones(K) + self.kappa * (np.arange(K) == k)
+    #         lp += np.dot((alpha - 1), log_P[k])
+    #     return lp
+
     def log_prior(self):
         K = self.K
-        log_P = self.log_Ps - logsumexp(self.log_Ps, axis=1, keepdims=True)
+        log_P = self.log_Ps - torch.logsumexp(self.log_Ps, dim=1, keepdim=True)
 
         lp = 0
         for k in range(K):
-            alpha = self.alpha * np.ones(K) + self.kappa * (np.arange(K) == k)
-            lp += np.dot((alpha - 1), log_P[k])
+            alpha = torch.tensor(self.alpha * np.ones(K) + self.kappa * (np.arange(K) == k), dtype=torch.double)
+            lp += (alpha - 1) @ log_P[k]
         return lp
 
     def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
@@ -220,7 +264,8 @@ class InputDrivenTransitions(StickyTransitions):
         super(InputDrivenTransitions, self).__init__(K, D, M=M, alpha=alpha, kappa=kappa)
 
         # Parameters linking input to state distribution
-        self.Ws = npr.randn(K, M)
+        # self.Ws = npr.randn(K, M)
+        self.Ws = torch.tensor(npr.randn(K, M))
 
         # Regularization of Ws
         self.l2_penalty = l2_penalty
@@ -240,9 +285,14 @@ class InputDrivenTransitions(StickyTransitions):
         self.log_Ps = self.log_Ps[np.ix_(perm, perm)]
         self.Ws = self.Ws[perm]
 
+    # def log_prior(self):
+    #     lp = super(InputDrivenTransitions, self).log_prior()
+    #     lp = lp + np.sum(-0.5 * self.l2_penalty * self.Ws**2)
+    #     return lp
+
     def log_prior(self):
         lp = super(InputDrivenTransitions, self).log_prior()
-        lp = lp + np.sum(-0.5 * self.l2_penalty * self.Ws**2)
+        lp = lp + torch.sum(-0.5 * self.l2_penalty * self.Ws**2)
         return lp
 
     def log_transition_matrices(self, data, input, mask, tag):
@@ -266,11 +316,12 @@ class RecurrentTransitions(InputDrivenTransitions):
     """
     Generalization of the input driven HMM in which the observations serve as future inputs
     """
-    def __init__(self, K, D, M=0, alpha=1, kappa=0):
-        super(RecurrentTransitions, self).__init__(K, D, M, alpha=alpha, kappa=kappa)
+    def __init__(self, K, D, M=0, alpha=1, kappa=0, l2_penalty=0.0):
+        super(RecurrentTransitions, self).__init__(K, D, M, alpha=alpha, kappa=kappa, l2_penalty=l2_penalty)
 
         # Parameters linking past observations to state distribution
-        self.Rs = np.zeros((K, D))
+        # self.Rs = np.zeros((K, D))
+        self.Rs = torch.tensor(np.zeros((K, D)))
 
     @property
     def params(self):
@@ -289,14 +340,41 @@ class RecurrentTransitions(InputDrivenTransitions):
         self.Rs = self.Rs[perm]
 
     def log_transition_matrices(self, data, input, mask, tag):
-        T, _ = data.shape
+        T, _ = data.shape # (T,N)
         # Previous state effect
-        log_Ps = np.tile(self.log_Ps[None, :, :], (T-1, 1, 1))
+        log_Ps = np.tile(self.log_Ps[None, :, :], (T-1, 1, 1)) # (T-1, K, K)
         # Input effect
-        log_Ps = log_Ps + np.dot(input[1:], self.Ws.T)[:, None, :]
+        log_Ps = log_Ps + np.dot(input[1:], self.Ws.T)[:, None, :] # (T-1, K, K) + (T-1, 0) * (0, K) = (T-1, K, K) + (T-1, 1, K)
         # Past observations effect
-        log_Ps = log_Ps + np.dot(data[:-1], self.Rs.T)[:, None, :]
-        return log_Ps - logsumexp(log_Ps, axis=2, keepdims=True)
+        log_Ps = log_Ps + np.dot(data[:-1], self.Rs.T)[:, None, :] # (T-1, K, K) + (T-1, D) * (D, K) = (T-1, K, K) + (T-1, 1, K)
+        return log_Ps - logsumexp(log_Ps, axis=2, keepdims=True) # (T-1, K, K) - (T-1, K, 1)
+
+    def log_transition_matrices_3d(self, datas, inputs, masks, tags, m_step=False):
+        B, T, D = datas.shape
+        if m_step:
+            raise NotImplementedError
+            log_Ps = np.tile(self.log_Ps, (B, T-1, 1, 1))
+            WsT = self.Ws.T
+            RsT = self.Rs.T
+            log_Ps = log_Ps + np.tensordot(inputs.cpu().numpy()[:, 1:], WsT, 1)[:, :, None, :]
+            log_Ps = log_Ps + np.tensordot(datas.cpu().numpy()[:, :-1], RsT, 1)[:, :, None, :]
+            return log_Ps - logsumexp(log_Ps, axis=3, keepdims=True)
+        else:
+            if isinstance(self.log_Ps, np.numpy_boxes.ArrayBox):
+                raise NotImplementedError
+                log_Ps = torch.tensor(self.log_Ps._value[None, :, :], device=datas.device).repeat(B, T-1, 1, 1)
+                WsT = torch.tensor(self.Ws._value.T, device=datas.device)
+                RsT = torch.tensor(self.Rs._value.T, device=datas.device)
+            else:
+                # log_Ps = torch.tensor(self.log_Ps[None, :, :], device=datas.device).repeat(B, T-1, 1, 1)
+                # WsT = torch.tensor(self.Ws.T, device=datas.device)
+                # RsT = torch.tensor(self.Rs.T, device=datas.device)
+                log_Ps = self.log_Ps.repeat(B, T-1, 1, 1)
+                WsT = self.Ws.T
+                RsT = self.Rs.T
+            log_Ps = log_Ps + torch.tensordot(inputs[:, 1:], WsT, 1)[:, :, None, :]
+            log_Ps = log_Ps + torch.tensordot(datas[:, :-1], RsT, 1)[:, :, None, :]
+            return log_Ps - torch.logsumexp(log_Ps, dim=3, keepdim=True)
 
     def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
         Transitions.m_step(self, expectations, datas, inputs, masks, tags, **kwargs)
@@ -309,10 +387,25 @@ class RecurrentTransitions(InputDrivenTransitions):
         Ez = np.sum(expected_joints, axis=2) # marginal over z from T=1 to T-1
         for k in range(self.K):
             vtilde = vtildes[:,k,:] # normalized probabilities given state k
-            Rv = vtilde @ self.Rs
+            Rv = vtilde @ self.Rs # (T-1,K) @ (K,D)
             hess += Ez[:,k][:,None,None] * \
                     ( np.einsum('tn, ni, nj ->tij', -vtilde, self.Rs, self.Rs) \
                     + np.einsum('ti, tj -> tij', Rv, Rv))
+        return -1 * hess
+    
+    def neg_hessian_expected_log_trans_prob_3d(self, datas, inputs, masks, tags, expected_joints):
+        B, T, D = datas.shape
+        hess = torch.zeros((B,T-1,D,D), dtype=torch.double, device=datas.device)
+        vtildes = torch.exp(self.log_transition_matrices_3d(datas, inputs, masks, tags)) # (B,T-1,K,K)
+        Ezs = torch.sum(expected_joints, axis=3) # (B,T-1,K)
+        # Rs = torch.tensor(self.Rs, device=datas.device)
+        Rs = self.Rs
+        for k in range(self.K): # still looping over k, can improve
+            vtilde = vtildes[:,:,k,:]
+            Rv = vtilde @ Rs # (B,T-1,K) @ (K,D)
+            hess += Ezs[:,:,k][:,:,None,None] * \
+                (torch.einsum('btn,ni,nj->btij', -vtilde, Rs, Rs) \
+                + torch.einsum('bti,btj->btij', Rv, Rv))
         return -1 * hess
 
 class RecurrentOnlyTransitions(Transitions):

@@ -7,7 +7,8 @@ from autograd import value_and_grad
 
 from ssm.optimizers import adam_step, rmsprop_step, sgd_step, convex_combination
 from ssm.primitives import hmm_normalizer
-from ssm.messages import hmm_expected_states, hmm_filter, hmm_sample, viterbi
+from ssm.messages import hmm_expected_states, hmm_filter, hmm_sample, viterbi, \
+    hmm_expected_states_3d
 from ssm.util import ensure_args_are_lists, ensure_args_not_none, \
     ensure_slds_args_not_none, ensure_variational_args_are_lists, \
     replicate, collapse, ssm_pbar
@@ -17,6 +18,8 @@ import ssm.transitions as trans
 import ssm.init_state_distns as isd
 import ssm.hierarchical as hier
 import ssm.emissions as emssn
+
+import torch
 
 __all__ = ['HMM', 'HSMM']
 
@@ -138,7 +141,7 @@ class HMM(object):
         self.transitions.params = value[1]
         self.observations.params = value[2]
 
-    @ensure_args_are_lists
+    # @ensure_args_are_lists
     def initialize(self, datas, inputs=None, masks=None, tags=None, init_method="random"):
         """
         Initialize parameters given data.
@@ -256,6 +259,16 @@ class HMM(object):
         Ps = self.transitions.transition_matrices(data, input, mask, tag)
         log_likes = self.observations.log_likelihoods(data, input, mask, tag)
         return hmm_expected_states(pi0, Ps, log_likes)
+    
+    # @ensure_args_are_lists
+    def expected_states_3d(self, datas, inputs=None, masks=None, tags=None):
+        pi0 = self.init_state_distn.initial_state_distn
+        Ps = self.transitions.transition_matrices_3d(datas, inputs, masks, tags)
+        log_likes = self.observations.log_likelihoods_3d(datas, inputs, masks, tags)
+        # expected = [hmm_expected_states(pi0.cpu().numpy(), Ps[i].cpu().numpy(), log_likes[i].cpu().numpy()) for i in range(Ps.shape[0])]
+        # expectations = [torch.tensor(np.stack(e), device=datas.device) for e in list(zip(*expected))]
+        expectations = hmm_expected_states_3d(pi0[None, :].repeat(Ps.shape[0], 1), Ps, log_likes)
+        return expectations
 
     @ensure_args_not_none
     def most_likely_states(self, data, input=None, mask=None, tag=None):
@@ -288,7 +301,7 @@ class HMM(object):
                self.transitions.log_prior() + \
                self.observations.log_prior()
 
-    @ensure_args_are_lists
+    # @ensure_args_are_lists
     def log_likelihood(self, datas, inputs=None, masks=None, tags=None):
         """
         Compute the log probability of the data under the current
@@ -297,17 +310,37 @@ class HMM(object):
         :param datas: single array or list of arrays of data.
         :return total log probability of the data.
         """
-        ll = 0
-        for data, input, mask, tag in zip(datas, inputs, masks, tags):
-            pi0 = self.init_state_distn.initial_state_distn
-            Ps = self.transitions.transition_matrices(data, input, mask, tag)
-            log_likes = self.observations.log_likelihoods(data, input, mask, tag)
-            ll += hmm_normalizer(pi0, Ps, log_likes)
-            assert np.isfinite(ll)
+        # ll = 0
+        # import time
+        # t = time.time()
+        # for data, input, mask, tag in zip(datas, inputs, masks, tags):
+        #     pi0 = self.init_state_distn.initial_state_distn # (K,)
+        #     Ps = self.transitions.transition_matrices(data, input, mask, tag)
+        #     log_likes = self.observations.log_likelihoods(data, input, mask, tag)
+        #     ll += hmm_normalizer(pi0, Ps, log_likes)
+        #     assert np.isfinite(ll)
+        # print(time.time() - t)
+        # t = time.time()
+        ll = self.log_likelihood_3d(datas, inputs, masks, tags)
+        # print(time.time() - t)
         return ll
 
-    @ensure_args_are_lists
+    def log_likelihood_3d(self, datas, inputs, masks, tags):
+        ll = 0
+        pi0 = self.init_state_distn.initial_state_distn # (K,)
+        Ps = self.transitions.transition_matrices_3d(datas, inputs, masks, tags) # (B, T-1, K, K)
+        log_likes = self.observations.log_likelihoods_3d(datas, inputs, masks, tags) # (B, T, K)
+        for i in range(datas.shape[0]):
+            ll += hmm_normalizer(pi0.cpu().numpy(), Ps[i].cpu().numpy(), log_likes[i].cpu().numpy())
+        assert np.isfinite(ll)
+        return ll
+
+    # @ensure_args_are_lists
     def log_probability(self, datas, inputs=None, masks=None, tags=None):
+        if inputs is None:
+            inputs = torch.zeros((datas.shape[0], datas.shape[1], self.M), dtype=torch.double, device=datas.device)
+        if masks is None:
+            masks = torch.ones((datas.shape[0], datas.shape[1], self.D), dtype=torch.bool, device=datas.device)
         return self.log_likelihood(datas, inputs, masks, tags) + self.log_prior()
 
     def expected_log_likelihood(
@@ -446,9 +479,7 @@ class HMM(object):
 
         for itr in pbar:
             # E step: compute expected latent states with current parameters
-            expectations = [self.expected_states(data, input, mask, tag)
-                            for data, input, mask, tag,
-                            in zip(datas, inputs, masks, tags)]
+            expectations = self.expected_states_3d(datas, inputs, masks, tags)
 
             # M step: maximize expected log joint wrt parameters
             self.init_state_distn.m_step(expectations, datas, inputs, masks, tags, **init_state_mstep_kwargs)
@@ -456,7 +487,7 @@ class HMM(object):
             self.observations.m_step(expectations, datas, inputs, masks, tags, **observations_mstep_kwargs)
 
             # Store progress
-            lls.append(self.log_prior() + sum([ll for (_, _, ll) in expectations]))
+            lls.append(self.log_prior() + sum(expectations[2]).cpu().numpy())
 
             if verbose == 2:
               pbar.set_description("LP: {:.1f}".format(lls[-1]))
@@ -466,10 +497,10 @@ class HMM(object):
                 if verbose == 2:
                   pbar.set_description("Converged to LP: {:.1f}".format(lls[-1]))
                 break
-
+        
         return lls
 
-    @ensure_args_are_lists
+    # @ensure_args_are_lists
     def fit(self, datas, inputs=None, masks=None, tags=None,
             verbose=2, method="em",
             initialize=True,

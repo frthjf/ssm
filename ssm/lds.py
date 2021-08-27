@@ -7,9 +7,10 @@ import autograd.numpy.random as npr
 from autograd import value_and_grad, grad
 
 from ssm.optimizers import adam_step, rmsprop_step, sgd_step, lbfgs, \
-    convex_combination, newtons_method_block_tridiag_hessian
+    convex_combination, newtons_method_block_tridiag_hessian, newtons_method_block_tridiag_hessian_3d, \
+    convex_combination_torch
 from ssm.primitives import hmm_normalizer
-from ssm.messages import hmm_expected_states, viterbi
+from ssm.messages import hmm_expected_states, viterbi, hmm_expected_states_3d
 from ssm.util import ensure_args_are_lists, \
     ensure_slds_args_not_none, ensure_variational_args_are_lists, ssm_pbar
 
@@ -19,6 +20,8 @@ import ssm.init_state_distns as isd
 import ssm.emissions as emssn
 import ssm.hmm as hmm
 import ssm.variational as varinf
+
+import torch
 
 __all__ = ['SLDS', 'LDS']
 
@@ -157,7 +160,7 @@ class SLDS(object):
         self.dynamics.params = value[2]
         self.emissions.params = value[3]
 
-    @ensure_args_are_lists
+    # @ensure_args_are_lists
     def initialize(self, datas, inputs=None, masks=None, tags=None,
                    verbose=0,
                    num_init_iters=50,
@@ -167,9 +170,11 @@ class SLDS(object):
         self.emissions.initialize(datas, inputs, masks, tags)
 
         # Get the initialized variational mean for the data
-        xs = [self.emissions.invert(data, input, mask, tag)
-              for data, input, mask, tag in zip(datas, inputs, masks, tags)]
-        xmasks = [np.ones_like(x, dtype=bool) for x in xs]
+        # xs = [self.emissions.invert(data, input, mask, tag)
+        #       for data, input, mask, tag in zip(datas, inputs, masks, tags)]
+        # xmasks = [torch.ones_like(x, dtype=bool) for x in xs]
+        xs = self.emissions.invert(datas, inputs, masks, tags)
+        xmasks = torch.ones_like(xs, dtype=bool, device=datas.device)
 
         # Number of times to run the arhmm initialization (we'll use the one with the highest log probability as the initialization)
         pbar  = ssm_pbar(num_init_restarts, verbose, "ARHMM Initialization restarts", [''])
@@ -276,6 +281,14 @@ class SLDS(object):
         log_likes = self.dynamics.log_likelihoods(variational_mean, input, x_mask, tag)
         log_likes += self.emissions.log_likelihoods(data, input, mask, tag, variational_mean)
         return hmm_expected_states(pi0, Ps, log_likes)
+    
+    def expected_states_3d(self, variational_mean, datas, inputs, masks, tags):
+        x_masks = torch.ones_like(variational_mean, dtype=torch.bool, device=datas.device)
+        pi0 = self.init_state_distn.initial_state_distn[None, :].repeat(datas.shape[0], 1)
+        Ps = self.transitions.transition_matrices_3d(variational_mean, inputs, x_masks, tags)
+        log_likes = self.dynamics.log_likelihoods_3d(variational_mean, inputs, x_masks, tags)
+        log_likes += self.emissions.log_likelihoods_3d(datas, inputs, masks, tags, variational_mean)
+        return hmm_expected_states_3d(pi0, Ps, log_likes)
 
     @ensure_slds_args_not_none
     def most_likely_states(self, variational_mean, data, input=None, mask=None, tag=None):
@@ -293,6 +306,10 @@ class SLDS(object):
         """
         Ez, _, _ = self.expected_states(variational_mean, data, input, mask, tag)
         return self.emissions.smooth(Ez, variational_mean, data, input, tag)
+    
+    def smooth_3d(self, variational_mean, datas, inputs, masks, tags):
+        Ezs, *_ = self.expected_states_3d(variational_mean, datas, inputs, masks, tags)
+        return self.emissions.smooth_3d(Ezs, variational_mean, datas, inputs, masks, tags)
 
     @ensure_args_are_lists
     def log_probability(self, datas, inputs=None, masks=None, tags=None):
@@ -389,40 +406,56 @@ class SLDS(object):
         x_sampless = [variational_posterior.sample_continuous_states() for _ in range(num_samples)]
         # Convert this to a list of length len(datas) where each entry
         # is a tuple of length num_samples
-        x_sampless = list(zip(*x_sampless))
+        # x_sampless = list(zip(*x_sampless))
 
         # 1. Update the variational posterior on q(z) for fixed q(x)
         #    - Monte Carlo approximate the log transition matrices
         #    - Compute the expected log likelihoods (i.e. log dynamics probs)
         #    - If emissions depend on z, compute expected emission likelihoods
-        discrete_state_params = []
-        for x_samples, data, input, mask, tag in \
-            zip(x_sampless, datas, inputs, masks, tags):
+        # discrete_state_params = []
+        # for x_samples, data, input, mask, tag in \
+        #     zip(x_sampless, datas, inputs, masks, tags):
 
-            # Make a mask for the continuous states
-            x_mask = np.ones_like(x_samples[0], dtype=bool)
+        #     # Make a mask for the continuous states
+        #     x_mask = np.ones_like(x_samples[0], dtype=bool)
 
-            # Compute expected log initial distribution, transition matrices, and likelihoods
-            pi0 = np.mean(
-                [self.init_state_distn.initial_state_distn
-                 for x in x_samples], axis=0)
+        #     # Compute expected log initial distribution, transition matrices, and likelihoods
+        #     pi0 = np.mean(
+        #         [self.init_state_distn.initial_state_distn
+        #          for x in x_samples], axis=0)
 
-            Ps = np.mean(
-                [self.transitions.transition_matrices(x, input, x_mask, tag)
-                 for x in x_samples], axis=0)
+        #     Ps = np.mean(
+        #         [self.transitions.transition_matrices(x, input, x_mask, tag)
+        #          for x in x_samples], axis=0)
 
-            log_likes = np.mean(
-                [self.dynamics.log_likelihoods(x, input, x_mask, tag)
-                 for x in x_samples], axis=0)
+        #     log_likes = np.mean(
+        #         [self.dynamics.log_likelihoods(x, input, x_mask, tag)
+        #          for x in x_samples], axis=0)
 
-            if not self.emissions.single_subspace:
-                log_likes += np.mean(
-                    [self.emissions.log_likelihoods(data, input, mask, tag, x)
-                     for x in x_samples], axis=0)
+        #     if not self.emissions.single_subspace:
+        #         log_likes += np.mean(
+        #             [self.emissions.log_likelihoods(data, input, mask, tag, x)
+        #              for x in x_samples], axis=0)
 
-            discrete_state_params.append(dict(pi0=pi0,
-                                              Ps=Ps,
-                                              log_likes=log_likes))
+        #     discrete_state_params.append(dict(pi0=pi0,
+        #                                       Ps=Ps,
+        #                                       log_likes=log_likes))        
+        assert num_samples == 1, "more samples not supported, sweaty"
+        # x_sampless = torch.tensor(np.stack(x_sampless[0]), device=datas.device)
+        x_sampless = x_sampless[0]
+        x_masks = torch.ones_like(x_sampless, dtype=torch.bool, device=datas.device)
+        pi0 = self.init_state_distn.initial_state_distn[None, :].repeat(x_sampless.shape[0], 1)
+        Ps = self.transitions.transition_matrices_3d(x_sampless, inputs, x_masks, tags)
+        log_likes = self.dynamics.log_likelihoods_3d(x_sampless, inputs, x_masks, tags)
+        if not self.emissions.single_subspace:
+            log_likes += self.emissions.log_likelihoods_3d(datas, inputs, masks, tags, x_sampless)
+        # discrete_state_params = [dict(pi0=pi0, Ps=Ps[i].cpu().numpy(), log_likes=log_likes[i].cpu().numpy()) for i in range(datas.shape[0])]
+        discrete_state_params = dict(pi0=pi0, Ps=Ps, log_likes=log_likes)
+
+        # for p1, p2 in zip(discrete_state_params, discrete_state_params2):
+        #     assert np.all(p1['pi0'] - p2['pi0']) < 1e-6, "fail pi0"
+        #     assert np.all(p1['Ps'] - p2['Ps']) < 1e-6, "fail Ps"
+        #     assert np.all(p1['log_likes'] - p2['log_likes']) < 1e-6, "fail ll"
 
         # Update the variational parameters
         variational_posterior.discrete_state_params = discrete_state_params
@@ -450,6 +483,18 @@ class SLDS(object):
         elp += np.sum(Ezzp1 * log_Ps)
         elp += np.sum(Ez * log_likes)
         assert np.all(np.isfinite(elp))
+        return -1 * elp / scale
+
+    def _laplace_neg_expected_log_joint_3d(self, datas, inputs, masks, tags, xs, Ezs, Ezzp1s, scale=1):
+        x_masks = torch.ones_like(xs, dtype=torch.bool, device=datas.device)
+        log_pi0 = self.init_state_distn.log_initial_state_distn
+        log_Ps = self.transitions.log_transition_matrices_3d(xs, inputs, x_masks, tags)
+        log_likes = self.dynamics.log_likelihoods_3d(xs, inputs, x_masks, tags)
+        log_likes += self.emissions.log_likelihoods_3d(datas, inputs, masks, tags, xs)
+        elp = torch.sum(Ezs[:, 0] * log_pi0, axis=1)
+        elp += torch.sum(Ezzp1s * log_Ps, axis=(1,2,3))
+        elp += torch.sum(Ezs * log_likes, axis=(1,2))
+        assert torch.all(torch.isfinite(elp))
         return -1 * elp / scale
 
     # We also need the hessian of the of the expected log joint
@@ -482,6 +527,34 @@ class SLDS(object):
         # Return the scaled negative hessian, which is positive definite
         return hessian_diag / scale, hessian_lower_diag / scale
 
+    def _laplace_neg_hessian_params_3d(self, datas, inputs, masks, tags, xs, Ezs, Ezzp1s, scale=1):
+        B, T, D = xs.shape
+        x_masks = torch.ones_like(xs, dtype=torch.bool, device=datas.device)
+
+        J_ini, J_dyn_11, J_dyn_21, J_dyn_22 = self.dynamics.\
+            neg_hessian_expected_log_dynamics_prob_3d(Ezs, xs, inputs, x_masks, tags)
+        J_transitions = self.transitions.\
+            neg_hessian_expected_log_trans_prob_3d(xs, inputs, x_masks, tags, Ezzp1s)
+        J_dyn_11 += J_transitions
+
+        J_obs = self.emissions.\
+            neg_hessian_log_emissions_prob_3d(datas, inputs, masks, tags, xs, Ezs)
+
+        return J_ini, J_dyn_11, J_dyn_21, J_dyn_22, J_obs
+    
+    def _laplace_hessian_neg_expected_log_joint_3d(self, datas, inputs, masks, tags, xs, Ezs, Ezzp1s, scale=1):
+        J_ini, J_dyn_11, J_dyn_21, J_dyn_22, J_obs = \
+            self._laplace_neg_hessian_params_3d(datas, inputs, masks, tags, xs, Ezs, Ezzp1s)
+                
+        hessian_diag = torch.zeros_like(J_obs, dtype=torch.double, device=datas.device)
+        hessian_diag += J_obs
+        hessian_diag[:, 0] += J_ini
+        hessian_diag[:, :-1] += J_dyn_11
+        hessian_diag[:, 1:] += J_dyn_22
+        hessian_lower_diag = J_dyn_21
+
+        return hessian_diag / scale, hessian_lower_diag / scale
+
     def _laplace_neg_hessian_params_to_hs(self,
                                           x,
                                           J_ini,
@@ -498,6 +571,15 @@ class SLDS(object):
         h_dyn_2 += (J_dyn_21 @ x[:-1][:, :, None])[:, :, 0]
 
         h_obs = (J_obs @ x[:, :, None])[:, :, 0]
+        return h_ini, h_dyn_1, h_dyn_2, h_obs
+    
+    def _laplace_neg_hessian_params_to_hs_3d(self, xs, J_ini, J_dyn_11, J_dyn_21, J_dyn_22, J_obs):
+        h_ini = (J_ini @ xs[:, 0][:, :, None]).squeeze()
+        h_dyn_1 = (J_dyn_11 @ xs[:, :-1][:, :, :, None])[:, :, :, 0]
+        h_dyn_1 += (J_dyn_21.permute(0, 1, 3, 2) @ xs[:, 1:][:, :, :, None])[:, :, :, 0]
+        h_dyn_2 = (J_dyn_22 @ xs[:, 1:][:, :, :, None])[:, :, :, 0]
+        h_dyn_2 += (J_dyn_21 @ xs[:, :-1][:, :, :, None])[:, :, :, 0]
+        h_obs = (J_obs @ xs[:, :, :, None])[:, :, :, 0]
         return h_ini, h_dyn_1, h_dyn_2, h_obs
 
     def _fit_laplace_em_continuous_state_update(self,
@@ -521,50 +603,91 @@ class SLDS(object):
         # Optimize the expected log joint for each data array to find the mode
         # and the curvature around the mode.  This gives a  Laplace approximation
         # for q(x).
-        continuous_state_params = []
         x0s = variational_posterior.mean_continuous_states
-        for (Ez, Ezzp1, _), x0, data, input, mask, tag in \
-            zip(variational_posterior.discrete_expectations,
-                x0s, datas, inputs, masks, tags):
+        # import time
+        # t = time.time()
+        # for (Ez, Ezzp1, _), x0, data, input, mask, tag in \
+        #     zip(variational_posterior.discrete_expectations,
+        #         x0s, datas, inputs, masks, tags):
 
-            # Use Newton's method or LBFGS to find the argmax of the expected log joint
-            scale = x0.size
-            kwargs = dict(data=data, input=input, mask=mask, tag=tag, Ez=Ez, Ezzp1=Ezzp1, scale=scale)
+        #     # Use Newton's method or LBFGS to find the argmax of the expected log joint
+        #     scale = x0.size
+        #     kwargs = dict(data=data, input=input, mask=mask, tag=tag, Ez=Ez, Ezzp1=Ezzp1, scale=scale)
 
-            def _objective(x, iter): return self._laplace_neg_expected_log_joint(x=x, **kwargs)
-            def _grad_obj(x): return grad(self._laplace_neg_expected_log_joint, argnum=4)(data, input, mask, tag, x, Ez, Ezzp1, scale)
-            def _hess_obj(x): return self._laplace_hessian_neg_expected_log_joint(x=x, **kwargs)
+        #     def _objective(x, iter): return self._laplace_neg_expected_log_joint(x=x, **kwargs)
+        #     def _grad_obj(x): return grad(self._laplace_neg_expected_log_joint, argnum=4)(data, input, mask, tag, x, Ez, Ezzp1, scale)
+        #     def _hess_obj(x): return self._laplace_hessian_neg_expected_log_joint(x=x, **kwargs)
 
-            if continuous_optimizer == "newton":
-                x = newtons_method_block_tridiag_hessian(
-                    x0, lambda x: _objective(x, None), _grad_obj, _hess_obj,
-                    tolerance=continuous_tolerance, maxiter=continuous_maxiter)
+        #     if continuous_optimizer == "newton":
+        #         x = newtons_method_block_tridiag_hessian(
+        #             x0, lambda x: _objective(x, None), _grad_obj, _hess_obj,
+        #             tolerance=continuous_tolerance, maxiter=continuous_maxiter)
 
-            elif continuous_optimizer  == "lbfgs":
-                x = lbfgs(_objective, x0, num_iters=continuous_maxiter,
-                          tol=continuous_tolerance)
+        #     elif continuous_optimizer  == "lbfgs":
+        #         x = lbfgs(_objective, x0, num_iters=continuous_maxiter,
+        #                   tol=continuous_tolerance)
 
-            else:
-                raise Exception("Invalid continuous_optimizer: {}".format(continuous_optimizer ))
+        #     else:
+        #         raise Exception("Invalid continuous_optimizer: {}".format(continuous_optimizer ))
 
-            # Evaluate the Hessian at the mode
-            assert np.all(np.isfinite(_objective(x, -1)))
+        #     # Evaluate the Hessian at the mode
+        #     assert np.all(np.isfinite(_objective(x, -1)))
 
-            J_ini, J_dyn_11, J_dyn_21, J_dyn_22, J_obs = self.\
-                _laplace_neg_hessian_params(data, input, mask, tag, x, Ez, Ezzp1)
-            h_ini, h_dyn_1, h_dyn_2, h_obs = \
-                self._laplace_neg_hessian_params_to_hs(x, J_ini, J_dyn_11,
-                                              J_dyn_21, J_dyn_22, J_obs)
+        #     J_ini, J_dyn_11, J_dyn_21, J_dyn_22, J_obs = self.\
+        #         _laplace_neg_hessian_params(data, input, mask, tag, x, Ez, Ezzp1)
+        #     h_ini, h_dyn_1, h_dyn_2, h_obs = \
+        #         self._laplace_neg_hessian_params_to_hs(x, J_ini, J_dyn_11,
+        #                                       J_dyn_21, J_dyn_22, J_obs)
 
-            continuous_state_params.append(dict(J_ini=J_ini,
-                                                J_dyn_11=J_dyn_11,
-                                                J_dyn_21=J_dyn_21,
-                                                J_dyn_22=J_dyn_22,
-                                                J_obs=J_obs,
-                                                h_ini=h_ini,
-                                                h_dyn_1=h_dyn_1,
-                                                h_dyn_2=h_dyn_2,
-                                                h_obs=h_obs))
+        #     continuous_state_params.append(dict(J_ini=J_ini,
+        #                                         J_dyn_11=J_dyn_11,
+        #                                         J_dyn_21=J_dyn_21,
+        #                                         J_dyn_22=J_dyn_22,
+        #                                         J_obs=J_obs,
+        #                                         h_ini=h_ini,
+        #                                         h_dyn_1=h_dyn_1,
+        #                                         h_dyn_2=h_dyn_2,
+        #                                         h_obs=h_obs))
+
+        # xs = torch.tensor(np.stack(x0s), device=datas.device)
+        # Ezs = torch.tensor(np.stack([e[0] for e in variational_posterior.discrete_expectations]), device=datas.device)
+        # Ezzp1s = torch.tensor(np.stack([e[1] for e in variational_posterior.discrete_expectations]), device=datas.device)
+        xs = x0s
+        Ezs, Ezzp1s, _ = variational_posterior.discrete_expectations
+        x_masks = torch.ones_like(xs, dtype=torch.bool)
+        scale = int(xs.shape[1] * xs.shape[2])
+        def _objective_3d(xss, trials, iter): return self._laplace_neg_expected_log_joint_3d(datas[trials], inputs[trials], masks[trials], None, xss, Ezs[trials], Ezzp1s[trials], scale=scale)
+        def _grad_obj_3d(xss, trials): return torch.autograd.grad([out for out in self._laplace_neg_expected_log_joint_3d(datas[trials], inputs[trials], masks[trials], None, xss, Ezs[trials], Ezzp1s[trials], scale=scale)], xss)[0]
+        def _hess_obj_3d(xss, trials): return self._laplace_hessian_neg_expected_log_joint_3d(datas[trials], inputs[trials], masks[trials], None, xss, Ezs[trials], Ezzp1s[trials], scale=scale)
+        assert continuous_optimizer == "newton", "not newton bruh"
+        xs = newtons_method_block_tridiag_hessian_3d(
+            xs, lambda x, trials: _objective_3d(x, trials, None), _grad_obj_3d, _hess_obj_3d, tolerance=continuous_tolerance, maxiter=continuous_maxiter
+        )
+        J_ini, J_dyn_11, J_dyn_21, J_dyn_22, J_obs = self.\
+            _laplace_neg_hessian_params_3d(datas, inputs, masks, tags, xs, Ezs, Ezzp1s, scale=xs[0].size)
+        h_ini, h_dyn_1, h_dyn_2, h_obs = \
+            self._laplace_neg_hessian_params_to_hs_3d(xs, J_ini, J_dyn_11,
+                                            J_dyn_21, J_dyn_22, J_obs)
+
+        # J_ini, J_dyn_11, J_dyn_21, J_dyn_22, J_obs, h_ini, h_dyn_1, h_dyn_2, h_obs = [arr.cpu().numpy() for arr in [J_ini, J_dyn_11, J_dyn_21, J_dyn_22, J_obs, h_ini, h_dyn_1, h_dyn_2, h_obs]]
+        
+        # continuous_state_params = [
+        #     dict(J_ini=J_ini[i], J_dyn_11=J_dyn_11[i], J_dyn_21=J_dyn_21[i], J_dyn_22=J_dyn_22[i],
+        #         J_obs=J_obs[i], h_ini=h_ini[i], h_dyn_1=h_dyn_1[i], h_dyn_2=h_dyn_2[i], h_obs=h_obs[i])
+        #     for i in range(len(J_ini))
+        # ]
+
+        continuous_state_params = dict(J_ini=J_ini,
+                    h_ini=h_ini,
+                    J_dyn_11=J_dyn_11,
+                    J_dyn_21=J_dyn_21,
+                    J_dyn_22=J_dyn_22,
+                    h_dyn_1=h_dyn_1,
+                    h_dyn_2=h_dyn_2,
+                    J_obs=J_obs,
+                    h_obs=h_obs)
+
+        # import pdb; pdb.set_trace()
 
         # Update the variational posterior params
         variational_posterior.continuous_state_params = continuous_state_params
@@ -578,20 +701,28 @@ class SLDS(object):
                                       emission_optimizer,
                                       emission_optimizer_maxiter,
                                       alpha):
+        import time
 
         # Compute necessary expectations either analytically or via samples
+        # t = time.time()
         continuous_samples = variational_posterior.sample_continuous_states()
         discrete_expectations = variational_posterior.discrete_expectations
+        # continuous_samples = torch.tensor(np.stack(continuous_samples), device=datas.device)
+        # discrete_expectations = [torch.tensor(np.stack(e), device=datas.device) for e in list(zip(*discrete_expectations))[:2]] + [None]
+        # print(time.time() - t)
 
         # Approximate update of initial distribution  and transition params.
         # Replace the expectation wrt x with sample from q(x). The parameter
         # update is partial and depends on alpha.
-        xmasks = [np.ones_like(x, dtype=bool) for x in continuous_samples]
+        # xmasks = [np.ones_like(x, dtype=bool) for x in continuous_samples]
+        xmasks = torch.ones_like(continuous_samples, dtype=torch.bool, device=datas.device)
         for distn in [self.init_state_distn, self.transitions]:
+            # t = time.time()
             curr_prms = copy.deepcopy(distn.params)
             if curr_prms == tuple(): continue
             distn.m_step(discrete_expectations, continuous_samples, inputs, xmasks, tags)
-            distn.params = convex_combination(curr_prms, distn.params, alpha)
+            distn.params = convex_combination_torch(curr_prms, distn.params, alpha)
+            # print(time.time() - t)
 
         kwargs = dict(expectations=discrete_expectations,
                       datas=continuous_samples,
@@ -604,6 +735,7 @@ class SLDS(object):
            obs.AutoRegressiveObservationsNoInput,
            obs.AutoRegressiveDiagonalNoiseObservations,
         ]
+        # t = time.time()
         if type(self.dynamics) in exact_m_step_dynamics and self.dynamics.lags == 1:
             # In this case, we can do an exact M-step on the dynamics by passing
             # in the true sufficient statistics for the continuous state.
@@ -614,14 +746,17 @@ class SLDS(object):
             curr_prms = copy.deepcopy(self.dynamics.params)
             self.dynamics.m_step(**kwargs)
             self.dynamics.params = convex_combination(curr_prms, self.dynamics.params, alpha)
+        # print(time.time() - t)
 
         # Update emissions params. This is always approximate (at least for now).
+        # t = time.time()
         curr_prms = copy.deepcopy(self.emissions.params)
         self.emissions.m_step(discrete_expectations, continuous_samples,
                               datas, inputs, masks, tags,
                               optimizer=emission_optimizer,
                               maxiter=emission_optimizer_maxiter)
-        self.emissions.params = convex_combination(curr_prms, self.emissions.params, alpha)
+        self.emissions.params = convex_combination_torch(curr_prms, self.emissions.params, alpha)
+        # print(time.time() - t)
 
     def _laplace_em_elbo(self,
                          variational_posterior,
@@ -636,26 +771,50 @@ class SLDS(object):
             for sample in range(n_samples):
 
                 # sample continuous states
+                # t = time.time()
                 continuous_samples = variational_posterior.sample_continuous_states()
+                # print(time.time() - t)
+                # t = time.time()
                 discrete_expectations = variational_posterior.discrete_expectations
+                # print(time.time() - t)
 
                 # log p(theta)
+                # exp_log_joint2 = exp_log_joint + self.log_prior()
                 exp_log_joint += self.log_prior()
 
-                for x, (Ez, Ezzp1, _), data, input, mask, tag in \
-                    zip(continuous_samples, discrete_expectations, datas, inputs, masks, tags):
+                # t = time.time()
+                # for x, (Ez, Ezzp1, _), data, input, mask, tag in \
+                #     zip(continuous_samples, discrete_expectations, datas, inputs, masks, tags):
 
-                    # The "mask" for x is all ones
-                    x_mask = np.ones_like(x, dtype=bool)
-                    log_pi0 = self.init_state_distn.log_initial_state_distn
-                    log_Ps = self.transitions.log_transition_matrices(x, input, x_mask, tag)
-                    log_likes = self.dynamics.log_likelihoods(x, input, x_mask, tag)
-                    log_likes += self.emissions.log_likelihoods(data, input, mask, tag, x)
+                #     # The "mask" for x is all ones
+                #     x_mask = np.ones_like(x, dtype=bool) # (T,D)
+                #     log_pi0 = self.init_state_distn.log_initial_state_distn # (K,)
+                #     log_Ps = self.transitions.log_transition_matrices(x, input, x_mask, tag) # (T-1,K,K)
+                #     log_likes = self.dynamics.log_likelihoods(x, input, x_mask, tag) # (T-1,K)
+                #     log_likes += self.emissions.log_likelihoods(data, input, mask, tag, x) # (T-1,1)?
 
-                    # Compute the expected log probability
-                    exp_log_joint += np.sum(Ez[0] * log_pi0)
-                    exp_log_joint += np.sum(Ezzp1 * log_Ps)
-                    exp_log_joint += np.sum(Ez * log_likes)
+                #     # Compute the expected log probability
+                #     exp_log_joint += np.sum(Ez[0] * log_pi0)
+                #     exp_log_joint += np.sum(Ezzp1 * log_Ps)
+                #     exp_log_joint += np.sum(Ez * log_likes)
+                # print(time.time() - t)
+                
+                # xs = torch.tensor(np.stack(continuous_samples), device=datas.device)
+                # Ezs = torch.tensor(np.stack([e[0] for e in discrete_expectations]), device=datas.device)
+                # Ezzp1s = torch.tensor(np.stack([e[1] for e in discrete_expectations]), device=datas.device)
+                xs = continuous_samples
+                Ezs, Ezzp1s, _ = discrete_expectations
+                x_masks = torch.ones_like(xs, dtype=torch.bool, device=datas.device)
+                log_pi0 = self.init_state_distn.log_initial_state_distn
+                log_Ps = self.transitions.log_transition_matrices_3d(xs, inputs, x_masks, tags)
+                log_likes = self.dynamics.log_likelihoods_3d(xs, inputs, x_masks, tags)
+                log_likes += self.emissions.log_likelihoods_3d(datas, inputs, masks, tags, xs)
+                exp_log_joint += torch.sum(Ezs[:, 0] * log_pi0)
+                exp_log_joint += torch.sum(Ezzp1s * log_Ps)
+                exp_log_joint += torch.sum(Ezs * log_likes)
+                # assert np.abs(exp_log_joint - exp_log_joint2) < 1e-6
+                assert torch.all(torch.isfinite(exp_log_joint))
+            # return exp_log_joint.cpu().numpy() / n_samples
             return exp_log_joint / n_samples
 
         return estimate_expected_log_joint(n_samples) + variational_posterior.entropy()
@@ -671,7 +830,10 @@ class SLDS(object):
                         emission_optimizer="lbfgs",
                         emission_optimizer_maxiter=100,
                         alpha=0.5,
-                        learning=True):
+                        learning=True,
+                        thresh=None,
+                        behavior=None,
+                        score=False):
         """
         Fit an approximate posterior p(z, x | y) \approx q(z) q(x).
         Perform block coordinate ascent on q(z) followed by q(x).
@@ -679,20 +841,42 @@ class SLDS(object):
         and that we update q(x) via Laplace approximation.
         Assume q(z) is a chain-structured discrete graphical model.
         """
-        elbos = [self._laplace_em_elbo(variational_posterior, datas, inputs, masks, tags)]
+        import time
+        # import pdb; pdb.set_trace()
+        elbos = [self._laplace_em_elbo(variational_posterior, datas, inputs, masks, tags).cpu().numpy()[()]]
+        if score:
+            nll, r2 = self.eval_res(datas, variational_posterior, behavior=behavior)
+            nlls = [nll]
+            r2s = [r2]
+        else:
+            nlls = None
+            r2s = None
 
         pbar = ssm_pbar(num_iters, verbose, "ELBO: {:.1f}", [elbos[-1]])
 
+        num = 0
         for itr in pbar:
+            # try:
+            #     os.mkdir(f'./iter_{num}/')
+            # except:
+            #     pass
             # 1. Update the discrete state posterior q(z) if K>1
             if self.K > 1:
                 self._fit_laplace_em_discrete_state_update(
                     variational_posterior, datas, inputs, masks, tags, num_samples)
 
+                # if not learning:
+                #     for key in ['pi0', 'Ps', 'log_likes']:
+                #         np.save(f'./iter_{num}/new_{key}.npy', variational_posterior.discrete_state_params[key][69].cpu().numpy())
+
             # 2. Update the continuous state posterior q(x)
             self._fit_laplace_em_continuous_state_update(
                 variational_posterior, datas, inputs, masks, tags,
                 continuous_optimizer, continuous_tolerance, continuous_maxiter)
+                
+            # if not learning:
+            #     for key in variational_posterior.continuous_state_params.keys():
+            #         np.save(f'./iter_{num}/new_{key}.npy', variational_posterior.continuous_state_params[key][69].cpu().numpy())
 
             # Update parameters
             if learning:
@@ -700,12 +884,34 @@ class SLDS(object):
                     variational_posterior, datas, inputs, masks, tags,
                     emission_optimizer, emission_optimizer_maxiter, alpha)
 
+                # for name, distn in zip(['init_state', 'trans', 'dynam', 'emiss'], [self.init_state_distn, self.transitions, self.dynamics, self.emissions]):
+                #     for i, arr in enumerate(distn.params):
+                #         np.save(f'./iter_{num}/new_{name}_params_{i}.npy', arr.cpu().numpy())
+
             elbos.append(self._laplace_em_elbo(
-                variational_posterior, datas, inputs, masks, tags))
+                variational_posterior, datas, inputs, masks, tags).cpu().numpy()[()])
             if verbose == 2:
               pbar.set_description("ELBO: {:.1f}".format(elbos[-1]))
+        
+            if score:
+                nll, r2 = self.eval_res(datas, variational_posterior, behavior=behavior)
+                nlls.append(nll)
+                r2s.append(r2)
 
-        return np.array(elbos)
+            num += 1
+
+            # if elbos[-1] < elbos[-2]:
+            #     alpha = (1 - (1 - alpha) * 0.9)
+            #     if np.abs(alpha - 1) < 0.01:
+            #         print(f"Learning rate approaching 0 - stopping early at iteration {num}")
+            #         break
+            
+            if thresh is not None and len(elbos) > 10:
+                if np.mean(np.abs(np.diff(elbos[-6:]))) < thresh:
+                    print(f"Average ELBOS change less than {thresh} for last 5 iterations - stopping early at iteration {num}")
+                    break
+
+        return np.array(elbos), np.array(nlls), np.array(r2s)
 
     def _make_variational_posterior(self, variational_posterior, datas, inputs, masks, tags, method, **variational_posterior_kwargs):
         # Initialize the variational posterior
@@ -742,7 +948,7 @@ class SLDS(object):
 
         return posterior
 
-    @ensure_args_are_lists
+    # @ensure_args_are_lists
     def fit(self, datas, inputs=None, masks=None, tags=None, verbose=2,
             method="laplace_em", variational_posterior="structured_meanfield",
             variational_posterior_kwargs=None,
@@ -750,6 +956,7 @@ class SLDS(object):
             discrete_state_init_method="random",
             num_init_iters=25,
             num_init_restarts=1,
+            gpu_ix=-1,
             **kwargs):
 
         """
@@ -775,6 +982,12 @@ class SLDS(object):
             raise Exception("Invalid method: {}. Options are {}".\
                             format(method, _fitting_methods.keys()))
 
+        if not isinstance(datas, torch.Tensor):
+            datas, inputs, masks, tags = self.prep_inputs(datas, inputs, masks, tags, gpu_ix=gpu_ix)
+            new_torches = True
+        else:
+            new_torches = False
+
         # Initialize the model parameters
         if initialize:
             self.initialize(datas, inputs, masks, tags,
@@ -784,17 +997,24 @@ class SLDS(object):
                             num_init_restarts=num_init_restarts)
 
         # Initialize the variational posterior
-        variational_posterior_kwargs = variational_posterior_kwargs or {}
-        posterior = self._make_variational_posterior(
-            variational_posterior, datas, inputs, masks, tags, method, **variational_posterior_kwargs)
-        elbos = _fitting_methods[method](
+        if isinstance(variational_posterior, str):
+            variational_posterior_kwargs = variational_posterior_kwargs or {}
+            posterior = self._make_variational_posterior(
+                variational_posterior, datas, inputs, masks, tags, method, **variational_posterior_kwargs)
+        else:
+            posterior = variational_posterior
+
+        elbos, nlls, r2s = _fitting_methods[method](
             posterior, datas, inputs, masks, tags, verbose,
             learning=True, **kwargs)
-        return elbos, posterior
+        
+        if new_torches:
+            del datas, inputs, masks, tags
+        return elbos, posterior, nlls, r2s
 
-    @ensure_args_are_lists
+    # @ensure_args_are_lists
     def approximate_posterior(self, datas, inputs=None, masks=None, tags=None,
-                              method="laplace_em", variational_posterior="structured_meanfield",
+                              method="laplace_em", variational_posterior="structured_meanfield", gpu_ix=-1,
                               **kwargs):
         """
         Fit an approximate posterior to data, without updating model params.
@@ -816,11 +1036,96 @@ class SLDS(object):
             raise Exception("Invalid method: {}. Options are {}".\
                             format(method, _fitting_methods.keys()))
 
-        # Initialize the variational posterior
-        posterior = self._make_variational_posterior(variational_posterior, datas, inputs, masks, tags, method)
-        elbos = _fitting_methods[method](posterior, datas, inputs, masks, tags, learning=False, **kwargs)
-        return elbos, posterior
+        if not isinstance(datas, torch.Tensor):
+            datas, inputs, masks, tags = self.prep_inputs(datas, inputs, masks, tags, gpu_ix=gpu_ix)
+            new_torches = True
+        else:
+            new_torches = False
 
+        # Initialize the variational posterior
+        if isinstance(variational_posterior, str):
+            posterior = self._make_variational_posterior(
+                variational_posterior, datas, inputs, masks, tags, method)
+        else:
+            posterior = variational_posterior
+        
+        elbos, nlls, r2s = _fitting_methods[method](posterior, datas, inputs, masks, tags, learning=False, **kwargs)
+        if new_torches:
+            del datas, inputs, masks, tags
+        return elbos, posterior, nlls, r2s
+
+    @ensure_args_are_lists
+    def prep_inputs(self, datas, inputs=None, masks=None, tags=None, gpu_ix=-1):
+        device = torch.device(f'cuda:{gpu_ix}') if gpu_ix >= 0 else torch.device('cpu')
+        datas = torch.tensor(np.stack(datas), dtype=torch.int, device=device)
+        inputs = torch.tensor(np.stack(inputs), device=device)
+        masks = torch.tensor(np.stack(masks), dtype=torch.bool, device=device)
+        tags = np.stack(tags)
+        return datas, inputs, masks, tags
+    
+    def single_step(self, datas):
+        pass
+
+    def eval_res(self, datas, posterior, masks=None, behavior=None):
+        raise NotImplementedError("Haven't updated this yet")
+        datas = datas.cpu().numpy().astype(int)
+        if masks is not None:
+            masks = masks.cpu().numpy().astype(bool)
+            rates = np.stack([self.smooth(posterior.mean_continuous_states[i], datas[i], mask=masks[i]) for i in range(len(datas))])
+        else:
+            rates = np.stack([self.smooth(posterior.mean_continuous_states[i], datas[i]) for i in range(len(datas))])
+        nll = neg_log_likelihood(rates, datas)
+
+        if behavior is not None:
+            dlen = behavior.shape[1]
+            rates = rates[:, :dlen]
+            rates_s = rates.reshape(-1, rates.shape[2])
+            behavior_s = behavior.reshape(-1, behavior.shape[2])
+
+            from sklearn.linear_model import Ridge
+            from sklearn.model_selection import GridSearchCV
+
+            gscv = GridSearchCV(Ridge(), {'alpha': np.logspace(4, 0, 5)})
+            gscv.fit(rates_s, behavior_s)
+            r2 = gscv.best_score_
+        else:
+            r2 = None
+        return nll, r2
+    
+def neg_log_likelihood(rates, spikes):
+    """Calculates Poisson negative log likelihood given rates and spikes.
+    Uses Stirling's approximation of log of factorial.
+    r = rate or lambda
+    n = count
+    formula: -log(e^(-r) / n! * r^n)
+           = r - n*log(r) + log(n!)
+           ~ r - n*log(r) + n*log(n) - n + 0.5*log(2*pi*n)
+    """  
+    spikes = spikes.astype(rates.dtype)
+    assert spikes.shape == rates.shape, \
+        f"Rates and spikes should be of the same shape. spikes: {spikes.shape}, rates: {rates.shape}"
+
+    if np.any(np.isnan(spikes)):
+        mask = np.isnan(spikes)
+        rates = rates[~mask]
+        spikes = spikes[~mask]
+    
+    assert not np.any(np.isnan(rates)), \
+        "NaN rate predictions found"
+
+    assert np.all(rates >= 0), \
+        "Negative rate predictions found"
+    if (np.any(rates == 0)):
+        print("Zero rate predictions found. Replacing zeros with 1e-9")
+        rates[rates == 0] = 1e-9
+    
+    result = rates - spikes * np.log(rates)
+    mask = (spikes > 1.0)
+    stirling = spikes * np.log(spikes, out=np.zeros_like(spikes), where=mask) - \
+        spikes + 0.5 * np.log(2 * np.pi * spikes, out=np.zeros_like(spikes), where=mask)
+    result += np.where(mask, stirling, 0.0)
+    # return np.mean(result)
+    return np.sum(result)
 
 class LDS(SLDS):
     """

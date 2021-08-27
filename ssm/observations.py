@@ -15,6 +15,8 @@ from ssm.cstats import robust_ar_statistics
 from ssm.optimizers import adam, bfgs, rmsprop, sgd, lbfgs
 import ssm.stats as stats
 
+import torch
+
 class Observations(object):
     # K = number of discrete states
     # D = number of observed dimensions
@@ -34,7 +36,7 @@ class Observations(object):
     def permute(self, perm):
         pass
 
-    @ensure_args_are_lists
+    # @ensure_args_are_lists
     def initialize(self, datas, inputs=None, masks=None, tags=None, init_method="random"):
         Ts = [data.shape[0] for data in datas]
 
@@ -55,7 +57,7 @@ class Observations(object):
 
         # Make a one-hot encoding of z and treat it as HMM expectations
         Ezs = [one_hot(z, self.K) for z in zs]
-        expectations = [(Ez, None, None) for Ez in Ezs]
+        expectations = (torch.tensor(np.stack(Ezs), device=datas.device), None, None) # [(Ez, None, None) for Ez in Ezs]
 
         # Set the variances all at once to use the setter
         self.m_step(expectations, datas, inputs, masks, tags)
@@ -764,26 +766,45 @@ class _AutoRegressiveObservationsBase(Observations):
         # assert np.all(mask), "ARHMM cannot handle missing data"
         K, M = self.K, self.M
         T, D = data.shape
-        As, bs, Vs, mu0s = self.As, self.bs, self.Vs, self.mu_init
+        As, bs, Vs, mu0s = self.As.cpu().numpy(), self.bs.cpu().numpy(), self.Vs.cpu().numpy(), self.mu_init
+        # As (K, D, D)
+        # bs (K, D)
+        # Vs (K, D, M)
+        # mu0s (K, D)
 
         # Instantaneous inputs
         mus = np.empty((K, T, D))
         mus = []
-        for k, (A, b, V, mu0) in enumerate(zip(As, bs, Vs, mu0s)):
+        for k, (A, b, V, mu0) in enumerate(zip(As, bs, Vs, mu0s)): # ASSUME lags = 1
             # Initial condition
-            mus_k_init = mu0 * np.ones((self.lags, D))
+            mus_k_init = mu0 * np.ones((self.lags, D)) # (1, D)
 
             # Subsequent means are determined by the AR process
-            mus_k_ar = np.dot(input[self.lags:, :M], V.T)
+            mus_k_ar = np.dot(input[self.lags:, :M], V.T) # (T-1, M) @ (M, D) = (T-1, D)
             for l in range(self.lags):
-                Al = A[:, l*D:(l + 1)*D]
-                mus_k_ar = mus_k_ar + np.dot(data[self.lags-l-1:-l-1], Al.T)
-            mus_k_ar = mus_k_ar + b
+                Al = A[:, l*D:(l + 1)*D] # (D, D)
+                mus_k_ar = mus_k_ar + np.dot(data[self.lags-l-1:-l-1], Al.T) # (T-1, D) + (T-1, D) @ (D, D)
+            mus_k_ar = mus_k_ar + b # (T-1, D) + (,D)
 
             # Append concatenated mean
-            mus.append(np.vstack((mus_k_init, mus_k_ar)))
+            mus.append(np.vstack((mus_k_init, mus_k_ar))) # (T, D)
 
-        return np.array(mus)
+        return np.array(mus) # (K, T, D)
+    
+    def _compute_mus_3d(self, datas, inputs, masks, tags):
+        K, M = self.K, self.M
+        B, T, D = datas.shape
+        As, bs, Vs, mu0s = self.As, self.bs, self.Vs, self.mu_init
+
+        if self.lags != 1:
+            raise NotImplementedError
+        
+        mus_k_init = torch.tensor(mu0s[:, None, :], device=datas.device).repeat(B,1,1,1) # (B, K, 1, D)
+        mus_k_ar = torch.tensordot(inputs[:, 1:, :M], Vs.permute(2, 0, 1), 1) # (B, T-1, M) @ (M, K, D) = (B, T-1, K, D)
+        mus_k_ar = mus_k_ar + torch.tensordot(datas[:, :-1], As.permute(2, 0, 1), 1) # (B, T-1, D) @ (D, K, D) = (B, T-1, K, D)
+        mus_k_ar = mus_k_ar + bs
+        mus = torch.cat([mus_k_init, mus_k_ar.permute(0, 2, 1, 3)], axis=2)
+        return mus # (B, K, T, D)
 
     def smooth(self, expectations, data, input, tag):
         """
@@ -819,27 +840,31 @@ class AutoRegressiveObservations(_AutoRegressiveObservationsBase):
                 np.column_stack([random_rotation(D), np.zeros((D, (lags-1) * D))])
             for _ in range(K)])
 
-        self._sqrt_Sigmas_init = np.tile(np.eye(D)[None, ...], (K, 1, 1))
-        self._sqrt_Sigmas = npr.randn(K, D, D)
+        # self._sqrt_Sigmas_init = np.tile(np.eye(D)[None, ...], (K, 1, 1))
+        # self._sqrt_Sigmas = npr.randn(K, D, D)
+        self._sqrt_Sigmas_init = torch.tensor(np.tile(np.eye(D)[None, ...], (K, 1, 1)))
+        self._sqrt_Sigmas = torch.tensor(npr.randn(K, D, D))
 
         # Set natural parameters of Gaussian prior on (A, V, b) weight matrix
         J0_diag = np.concatenate((l2_penalty_A * np.ones(D * lags),
                                   l2_penalty_V * np.ones(M),
                                   l2_penalty_b * np.ones(1)))
-        self.J0 = np.tile(np.diag(J0_diag)[None, :, :], (K, 1, 1))
+        self.J0 = torch.tensor(np.tile(np.diag(J0_diag)[None, :, :], (K, 1, 1)))
 
         h0 = np.concatenate((l2_penalty_A * np.eye(D),
                              np.zeros((D * (lags - 1), D)),
                              np.zeros((M + 1, D))))
-        self.h0 = np.tile(h0[None, :, :], (K, 1, 1))
+        self.h0 = torch.tensor(np.tile(h0[None, :, :], (K, 1, 1)))
 
         # Set natural parameters of inverse Wishart prior on Sigma
         self.nu0 = nu0
-        self.Psi0 = Psi0 * np.eye(D) if np.isscalar(Psi0) else Psi0
+        self.Psi0 = torch.tensor(Psi0 * np.eye(D) if np.isscalar(Psi0) else Psi0)
 
         self.l2_penalty_A = l2_penalty_A
         self.l2_penalty_b = l2_penalty_b
         self.l2_penalty_V = l2_penalty_V
+
+        # print(self.l2_penalty_A, self.l2_penalty_b, self.l2_penalty_V)
 
     @property
     def A(self):
@@ -861,21 +886,27 @@ class AutoRegressiveObservations(_AutoRegressiveObservationsBase):
 
     @property
     def Sigmas_init(self):
-        return np.matmul(self._sqrt_Sigmas_init, np.swapaxes(self._sqrt_Sigmas_init, -1, -2))
+        # return np.matmul(self._sqrt_Sigmas_init, np.swapaxes(self._sqrt_Sigmas_init, -1, -2))
+        return (self._sqrt_Sigmas_init @ self._sqrt_Sigmas_init.permute(0, 2, 1))
 
     @Sigmas_init.setter
     def Sigmas_init(self, value):
         assert value.shape == (self.K, self.D, self.D)
-        self._sqrt_Sigmas_init = np.linalg.cholesky(value + 1e-8 * np.eye(self.D))
+        # self._sqrt_Sigmas_init = np.linalg.cholesky(value + 1e-8 * np.eye(self.D))
+        # self._sqrt_Sigmas_init = torch.cholesky(value + 1e-8 * torch.eye(self.D))
+        self._sqrt_Sigmas_init = torch.linalg.cholesky(value + 1e-8 * torch.eye(self.D))
 
     @property
     def Sigmas(self):
-        return np.matmul(self._sqrt_Sigmas, np.swapaxes(self._sqrt_Sigmas, -1, -2))
+        # return np.matmul(self._sqrt_Sigmas, np.swapaxes(self._sqrt_Sigmas, -1, -2))
+        return (self._sqrt_Sigmas @ self._sqrt_Sigmas.permute(0, 2, 1))
 
     @Sigmas.setter
     def Sigmas(self, value):
         assert value.shape == (self.K, self.D, self.D)
-        self._sqrt_Sigmas = np.linalg.cholesky(value + 1e-8 * np.eye(self.D))
+        # self._sqrt_Sigmas = np.linalg.cholesky(value + 1e-8 * np.eye(self.D))
+        # self._sqrt_Sigmas = torch.cholesky(value + 1e-8 * torch.eye(self.D))
+        self._sqrt_Sigmas = torch.linalg.cholesky(value + 1e-8 * torch.eye(self.D))
 
     @property
     def params(self):
@@ -907,6 +938,19 @@ class AutoRegressiveObservations(_AutoRegressiveObservationsBase):
 
         return np.row_stack((ll_init, ll_ar))
 
+    def log_likelihoods_3d(self, datas, inputs, masks, tags=None):
+        assert torch.all(masks), "Cannot compute likelihood of autoregressive obsevations with missing data."
+        L = self.lags
+        mus = self._compute_mus_3d(datas, inputs, masks, tags)
+
+        ll_init = torch.dstack([stats.multivariate_normal_logpdf(datas[:,:L], mus[:,k,:L], self.Sigmas_init[k])
+                               for k in range(mus.shape[1])])
+        
+        ll_ar = torch.dstack([stats.multivariate_normal_logpdf(datas[:,L:], mus[:,k,L:], self.Sigmas[k])
+                            for k in range(mus.shape[1])])
+        
+        return torch.cat([ll_init, ll_ar], axis=1)
+
     def _get_sufficient_statistics(self, expectations, datas, inputs):
         K, D, M, lags = self.K, self.D, self.M, self.lags
         D_in = D * lags + M + 1
@@ -919,17 +963,17 @@ class AutoRegressiveObservations(_AutoRegressiveObservationsBase):
 
         # Iterate over data arrays and discrete states
         for (Ez, _, _), data, input in zip(expectations, datas, inputs):
-            u = input[lags:]
-            y = data[lags:]
+            u = input[lags:] # (T-1, M)
+            y = data[lags:] # (T-1, D)
             for k in range(K):
-                w = Ez[lags:, k]
+                w = Ez[lags:, k] # (T-1,)
 
                 # ExuxuTs[k]
                 for l1 in range(lags):
-                    x1 = data[lags-l1-1:-l1-1]
+                    x1 = data[lags-l1-1:-l1-1] # (T-1, D)
                     # Cross terms between lagged data and other lags
                     for l2 in range(l1, lags):
-                        x2 = data[lags - l2 - 1:-l2 - 1]
+                        x2 = data[lags - l2 - 1:-l2 - 1] # (T-1, D)
                         ExuxuTs[k, l1*D:(l1+1)*D, l2*D:(l2+1)*D] += np.einsum('t,ti,tj->ij', w, x1, x2)
 
                     # Cross terms between lagged data and inputs and bias
@@ -962,6 +1006,40 @@ class AutoRegressiveObservations(_AutoRegressiveObservationsBase):
 
         return ExuxuTs, ExuyTs, EyyTs, Ens
 
+    def _get_sufficient_statistics_3d(self, expectations, datas, inputs):
+        K, D, M, lags = self.K, self.D, self.M, self.lags
+        D_in = D * lags + M + 1
+        assert lags == 1, "uh oh"
+        assert M == 0, 'there are inputs so idk what to do'
+
+        # Initialize the outputs
+        ExuxuTs = torch.zeros((K, D_in, D_in), dtype=torch.double, device=datas.device)
+        ExuyTs = torch.zeros((K, D_in, D), dtype=torch.double, device=datas.device)
+        EyyTs = torch.zeros((K, D, D), dtype=torch.double, device=datas.device)
+        Ens = torch.zeros(K, dtype=torch.double, device=datas.device)
+    
+        Ez = expectations[0]
+
+        U = inputs[:, 1:]
+        Y = datas[:, 1:]
+        W = Ez[:, 1:]
+        X = datas[:, :-1]
+
+        ExuxuTs[:, :D, :D] += torch.einsum('btk,bti,btj->kij', W, X, X)
+        ExuxuTs[:, :D, -1] += torch.einsum('btk,bti->ki', W, X)
+        ExuxuTs[:, -1, -1] += torch.sum(W, axis=(0,1))
+
+        ExuyTs[:, :D, :] += torch.einsum('btk,bti,btj->kij', W, X, Y)
+        ExuyTs[:, -1, :] += torch.einsum('btk,bti->ki', W, Y)
+        
+        EyyTs += torch.einsum('btk,bti,btj->kij', W, Y, Y)
+        Ens += torch.sum(W, axis=(0,1))
+
+        for k in range(K):
+            ExuxuTs[k, -1, :D] = ExuxuTs[k, :D, -1].T
+        
+        return ExuxuTs, ExuyTs, EyyTs, Ens
+
     def _extend_given_sufficient_statistics(self, expectations, continuous_expectations, inputs):
         # Extend continuous_expectations with given inputs and discrete weights
         assert self.lags == 1, "_extend_given_sufficient_statistics assumes lags == 1."
@@ -976,13 +1054,13 @@ class AutoRegressiveObservations(_AutoRegressiveObservationsBase):
 
         for (Ez, _, _), (_, Ex, smoothed_sigmas, Exxn), u in \
                 zip(expectations, continuous_expectations, inputs):
-            ExxT = smoothed_sigmas + np.einsum('ti,tj->tij', Ex, Ex)
-            u = u[lags:]
+            ExxT = smoothed_sigmas + np.einsum('ti,tj->tij', Ex, Ex) # (T,D,D)
+            u = u[lags:] # (T-1,M)
 
             for k in range(K):
-                w = Ez[lags:, k]
+                w = Ez[lags:, k] #(T-1,)
 
-                ExuxuTs[k, :D, :D] += np.einsum('t,tij->ij', w, ExxT[:-1])
+                ExuxuTs[k, :D, :D] += np.einsum('t,tij->ij', w, ExxT[:-1]) #(T-1,) * (T-1,D,D)
                 ExuxuTs[k, :D, D:D + M] += np.einsum('t,ti,tj->ij', w, Ex[:-1], u)
                 ExuxuTs[k, :D, -1] += np.einsum('t,ti->i', w, Ex[:-1])
                 ExuxuTs[k, D:D + M, D:D + M] += np.einsum('t,ti,tj->ij', w, u, u)
@@ -1002,6 +1080,39 @@ class AutoRegressiveObservations(_AutoRegressiveObservationsBase):
             ExuxuTs[k, -1, :D] = ExuxuTs[k, :D, -1].T
             ExuxuTs[k, -1, D:D + M] = ExuxuTs[k, D:D + M, -1].T
 
+        return ExuxuTs, ExuyTs, EyyTs, Ens
+    
+    def _extend_given_sufficient_statistics_3d(self, expectations, continuous_expectations, inputs):
+        K, D, M, lags = self.K, self.D, self.M, self.lags
+        D_in = D * lags + M + 1
+        assert lags == 1, "uh oh unfamiliar lag"
+        assert M == 0, 'there are inputs so idk what to do'
+
+        # Initialize the outputs
+        ExuxuTs = torch.zeros((K, D_in, D_in), dtype=torch.double, device=inputs.device)
+        ExuyTs = torch.zeros((K, D_in, D), dtype=torch.double, device=inputs.device)
+        EyyTs = torch.zeros((K, D, D), dtype=torch.double, device=inputs.device)
+        Ens = torch.zeros(K, dtype=torch.double, device=inputs.device)
+
+        Ez = expectations[0] # (B,T,K)
+        _, Ex, smoothed_sigmas, Exxn = continuous_expectations
+        ExxT = smoothed_sigmas + torch.einsum('bti,btj->btij', Ex, Ex) # (B,T,D,D)
+        U = inputs[:, lags:] # (B,T-1,M)
+        W = Ez[:, lags:] # (B,T-1,K)
+
+        ExuxuTs[:, :D, :D] += torch.einsum('btk,btij->kij', W, ExxT[:, :-1])
+        ExuxuTs[:, :D, -1] += torch.einsum('btk,bti->ki', W, Ex[:, :-1])
+        ExuxuTs[:, -1, -1] += torch.sum(W, axis=(0,1))
+
+        ExuyTs[:, :D, :] += torch.einsum('btk,btij->kij', W, Exxn)
+        ExuyTs[:, -1, :] += torch.einsum('btk,bti->ki', W, Ex[:, 1:])
+
+        EyyTs += torch.einsum('btk,btij->kij', W, ExxT[:, 1:])
+        Ens += torch.sum(W, axis=(0,1))
+
+        for k in range(K):
+            ExuxuTs[k, -1, :D] = ExuxuTs[k, :D, -1].T
+        
         return ExuxuTs, ExuyTs, EyyTs, Ens
 
     def m_step(self, expectations, datas, inputs, masks, tags,
@@ -1023,18 +1134,20 @@ class AutoRegressiveObservations(_AutoRegressiveObservationsBase):
 
         # Collect sufficient statistics
         if continuous_expectations is None:
-            ExuxuTs, ExuyTs, EyyTs, Ens = self._get_sufficient_statistics(expectations, datas, inputs)
+            # ExuxuTs, ExuyTs, EyyTs, Ens = self._get_sufficient_statistics(expectations, datas, inputs)
+            ExuxuTs, ExuyTs, EyyTs, Ens = self._get_sufficient_statistics_3d(expectations, datas, inputs)
         else:
             ExuxuTs, ExuyTs, EyyTs, Ens = \
-                self._extend_given_sufficient_statistics(expectations, continuous_expectations, inputs)
+                self._extend_given_sufficient_statistics_3d(expectations, continuous_expectations, inputs)
 
         # Solve the linear regressions
-        As = np.zeros((K, D, D * lags))
-        Vs = np.zeros((K, D, M))
-        bs = np.zeros((K, D))
-        Sigmas = np.zeros((K, D, D))
+        As = torch.zeros((K, D, D * lags), dtype=torch.double, device=datas.device)
+        Vs = torch.zeros((K, D, M), dtype=torch.double, device=datas.device)
+        bs = torch.zeros((K, D), dtype=torch.double, device=datas.device)
+        Sigmas = torch.zeros((K, D, D), dtype=torch.double, device=datas.device)
         for k in range(K):
-            Wk = np.linalg.solve(ExuxuTs[k] + self.J0[k], ExuyTs[k] + self.h0[k]).T
+            # Wk = torch.solve(ExuyTs[k] + self.h0[k], ExuxuTs[k] + self.J0[k])[0].T
+            Wk = torch.linalg.solve(ExuxuTs[k] + self.J0[k], ExuyTs[k] + self.h0[k]).T
             As[k] = Wk[:, :D * lags]
             Vs[k] = Wk[:, D * lags:-1]
             bs[k] = Wk[:, -1]
@@ -1046,20 +1159,21 @@ class AutoRegressiveObservations(_AutoRegressiveObservationsBase):
             Sigmas[k] = (sqerr + self.Psi0) / (nu + D + 1)
 
         # If any states are unused, set their parameters to a perturbation of a used state
-        unused = np.where(Ens < 1)[0]
-        used = np.where(Ens > 1)[0]
+        unused = torch.where(Ens < 1)[0]
+        used = torch.where(Ens > 1)[0]
         if len(unused) > 0:
             for k in unused:
                 i = npr.choice(used)
-                As[k] = As[i] + 0.01 * npr.randn(*As[i].shape)
-                Vs[k] = Vs[i] + 0.01 * npr.randn(*Vs[i].shape)
-                bs[k] = bs[i] + 0.01 * npr.randn(*bs[i].shape)
+                As[k] = As[i] + torch.tensor(0.01 * npr.randn(*As[i].shape), device=datas.device)
+                Vs[k] = Vs[i] + torch.tensor(0.01 * npr.randn(*Vs[i].shape), device=datas.device)
+                bs[k] = bs[i] + torch.tensor(0.01 * npr.randn(*bs[i].shape), device=datas.device)
                 Sigmas[k] = Sigmas[i]
 
         # Update parameters via their setter
         self.As = As
         self.Vs = Vs
         self.bs = bs
+        # self.Sigmas = Sigmas.cpu().numpy()
         self.Sigmas = Sigmas
 
     def sample_x(self, z, xhist, input=None, tag=None, with_noise=True):
@@ -1084,13 +1198,13 @@ class AutoRegressiveObservations(_AutoRegressiveObservationsBase):
         assert self.lags == 1, "Does not compute negative Hessian of autoregressive observations with lags > 1"
 
         # initial distribution contributes a Gaussian term to first diagonal block
-        J_ini = np.sum(Ez[0, :, None, None] * np.linalg.inv(self.Sigmas_init), axis=0)
+        J_ini = np.sum(Ez[0, :, None, None] * np.linalg.inv(self.Sigmas_init), axis=0) # (K, 1, 1) * (K, D, D)
 
         # first part is transition dynamics - goes to all terms except final one
         # E_q(z) x_{t} A_{z_t+1}.T Sigma_{z_t+1}^{-1} A_{z_t+1} x_{t}
-        inv_Sigmas = np.linalg.inv(self.Sigmas)
+        inv_Sigmas = np.linalg.inv(self.Sigmas) # (K, D, D)
         dynamics_terms = np.array([A.T@inv_Sigma@A for A, inv_Sigma in zip(self.As, inv_Sigmas)]) # A^T Qinv A terms
-        J_dyn_11 = np.sum(Ez[1:,:,None,None] * dynamics_terms[None,:], axis=1)
+        J_dyn_11 = np.sum(Ez[1:,:,None,None] * dynamics_terms[None,:], axis=1) # (T-1, K, 1, 1) @ (1, K, D, D)
 
         # second part of diagonal blocks are inverse covariance matrices - goes to all but first time bin
         # E_q(z) x_{t+1} Sigma_{z_t+1}^{-1} x_{t+1}
@@ -1102,7 +1216,19 @@ class AutoRegressiveObservations(_AutoRegressiveObservationsBase):
         J_dyn_21 = -1 * np.sum(Ez[1:,:,None,None] * off_diag_terms[None,:], axis=1)
 
         return J_ini, J_dyn_11, J_dyn_21, J_dyn_22
+    
+    def neg_hessian_expected_log_dynamics_prob_3d(self, Ezs, datas, inputs, masks, tags=None):
+        assert torch.all(masks), "Cannot compute negative Hessian of autoregressive observations with missing data"
+        assert self.lags == 1, "lag has to be 1"
 
+        J_ini = torch.sum(Ezs[:, 0, :, None, None] * torch.tensor(np.linalg.inv(self.Sigmas_init)[None, ...], device=datas.device), axis=1) # (B, D, D)
+        inv_Sigmas = torch.tensor(np.linalg.inv(self.Sigmas), device=datas.device) # (K, D, D)
+        dynamics_terms = self.As.permute(0, 2, 1) @ inv_Sigmas @ self.As # (K, D, D)
+        J_dyn_11 = torch.sum(Ezs[:, 1:, :, None, None] * dynamics_terms[None, None, :], axis=2) # (B, T-1, D, D)
+        J_dyn_22 = torch.sum(Ezs[:, 1:, :, None, None] * inv_Sigmas[None, None, :], axis=2) # (B, T-1, D, D)
+        off_diag_terms = inv_Sigmas @ self.As
+        J_dyn_21 = -1 * torch.sum(Ezs[:, 1:, :, None, None] * off_diag_terms[None, None, :], axis=2) # (B, T-1, D, D)
+        return J_ini, J_dyn_11, J_dyn_21, J_dyn_22
 
 class AutoRegressiveObservationsNoInput(AutoRegressiveObservations):
     """
@@ -1220,6 +1346,19 @@ class AutoRegressiveDiagonalNoiseObservations(AutoRegressiveObservations):
 
         # Compute the likelihood of the initial data and remainder separately
         return np.row_stack((ll_init, ll_ar))
+
+    def log_likelihoods_3d(self, datas, inputs, masks, tags=None):
+        assert torch.all(masks), "Cannot compute likelihood of autoregressive obsevations with missing data."
+        L = self.lags
+        mus = self._compute_mus_3d(datas, inputs, masks, tags)
+
+        ll_init = torch.dstack([stats.diagonal_gaussian_logpdf(datas[:,:L], mus[:,k,:L], self.Sigmas_init[k])
+                               for k in range(mus.shape[1])])
+        
+        ll_ar = torch.dstack([stats.diagonal_gaussian_logpdf(datas[:,L:], mus[:,k,L:], self.Sigmas[k])
+                            for k in range(mus.shape[1])])
+        
+        return torch.cat([ll_init, ll_ar], axis=1)
 
 
 class IndependentAutoRegressiveObservations(_AutoRegressiveObservationsBase):

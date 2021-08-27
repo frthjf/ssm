@@ -4,6 +4,7 @@ from autograd.scipy.linalg import solve_triangular
 
 from ssm.util import one_hot
 
+import torch
 
 def flatten_to_dim(X, d):
     """
@@ -97,6 +98,8 @@ def _multivariate_normal_logpdf(data, mus, Sigmas, Ls=None):
         Log probabilities under the multivariate Gaussian distribution(s).
     """
     # Check inputs
+    if isinstance(data, torch.Tensor):
+        return _multivariate_normal_logpdf_torch(data, mus, Sigmas, Ls)
     D = data.shape[-1]
     assert mus.shape[-1] == D
     assert Sigmas.shape[-2] == Sigmas.shape[-1] == D
@@ -111,6 +114,40 @@ def _multivariate_normal_logpdf(data, mus, Sigmas, Ls=None):
     L_diag = np.reshape(Ls, Ls.shape[:-2] + (-1,))[..., ::D + 1]     # (..., D)
     half_log_det = np.sum(np.log(abs(L_diag)), axis=-1)              # (...,)
     lp = lp - 0.5 * D * np.log(2 * np.pi) - half_log_det             # (...,)
+
+    return lp
+
+
+def batch_mahalanobis_torch(L, x):
+    assert L.ndim == 2, "Only 2-D Ls supported for now"
+    # Flatten the Cholesky into a (-1, D, D) array
+    flat_L = torch.reshape(L[None, ...], (-1,) + L.shape[-2:])
+    # Invert each of the K arrays and reshape like L
+    L_inv = torch.reshape(torch.stack([torch.inverse(Li.T) for Li in flat_L]), L.shape)
+    # dot with L_inv^T; square and sum.
+    try:
+        xs = torch.einsum('...i,ij->...j', x, L_inv)
+    except:
+        import pdb; pdb.set_trace()
+        print("unpog")
+    return torch.sum(xs**2, axis=-1)
+
+def _multivariate_normal_logpdf_torch(data, mus, Sigmas, Ls=None):
+    # Check inputs
+    D = data.shape[-1]
+    assert mus.shape[-1] == D
+    assert Sigmas.shape[-2] == Sigmas.shape[-1] == D
+    if Ls is not None:
+        assert Ls.shape[-2] == Ls.shape[-1] == D
+    else:
+        Ls = torch.tensor(np.linalg.cholesky(Sigmas), device=data.device)
+
+    # Quadratic term
+    lp = -0.5 * batch_mahalanobis_torch(Ls, data - mus)                   
+    # Normalizer
+    L_diag = torch.reshape(Ls, Ls.shape[:-2] + (-1,))[..., ::D + 1]     
+    half_log_det = torch.sum(torch.log(torch.abs(L_diag)), axis=-1)              
+    lp = lp - 0.5 * D * np.log(2 * np.pi) - half_log_det             
 
     return lp
 

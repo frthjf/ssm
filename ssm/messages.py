@@ -8,6 +8,8 @@ from autograd.tracer import getval
 from autograd.extend import primitive, defvjp
 from ssm.util import LOG_EPS, DIV_EPS
 
+import torch
+
 to_c = lambda arr: np.copy(getval(arr), 'C') if not arr.flags['C_CONTIGUOUS'] else getval(arr)
 
 @numba.jit(nopython=True, cache=True)
@@ -26,6 +28,10 @@ def logsumexp(x):
 
     return m + np.log(out)
 
+def logsumexp_torch(x): # assumes (B, N) shape, returns (B,)
+    m = torch.max(x, axis=1)[0]
+    out = torch.sum(torch.exp(x - m[:, None]), axis=1)
+    return m + torch.log(out)
 
 @numba.jit(nopython=True, cache=True)
 def dlse(a, out):
@@ -59,6 +65,22 @@ def forward_pass(pi0,
         alphas[t+1] = np.log(np.dot(np.exp(alphas[t] - m), Ps[t * hetero])) + m + log_likes[t+1]
     return logsumexp(alphas[T-1])
 
+
+def forward_pass_3d(pi0, Ps, log_likes, alphas):
+    B, T, K = log_likes.shape
+    
+    assert Ps.shape[1] == (T - 1) or Ps.shape[1] == 1
+    assert Ps.shape[2] == K
+    assert Ps.shape[3] == K
+    assert alphas.shape[1] == T
+    assert alphas.shape[2] == K
+
+    hetero = (Ps.shape[1] == (T - 1))
+    alphas[:, 0] = torch.log(pi0) + log_likes[:, 0]
+    for t in range(T-1):
+        m = torch.max(alphas[:, t], dim=1)[0]
+        alphas[:, t+1] = torch.log(torch.einsum('bi,bij->bj', torch.exp(alphas[:, t] - m[:, None]), Ps[:, t * hetero])) + m[:, None] + log_likes[:, t+1]
+    return alphas
 
 @numba.jit(nopython=True, cache=True)
 def hmm_filter(pi0, Ps, ll):
@@ -123,6 +145,23 @@ def backward_pass(Ps,
         betas[t] = np.log(np.dot(Ps[t * hetero], np.exp(tmp - m))) + m
 
 
+def backward_pass_3d(Ps, log_likes, betas):
+    B, T, K = log_likes.shape
+
+    assert Ps.shape[1] == T-1 or Ps.shape[1] == 1
+    assert Ps.shape[2] == K
+    assert Ps.shape[3] == K
+    assert betas.shape[1] == T
+    assert betas.shape[2] == K
+
+    tmp = torch.zeros((B, K), dtype=torch.double)
+    hetero = (Ps.shape[1] == T-1)
+    betas[:, T-1] = 0
+    for t in range(T-2,-1,-1):
+        tmp = log_likes[:, t+1] + betas[:, t+1]
+        m = torch.max(tmp, dim=1)[0]
+        betas[:, t] = torch.log(torch.einsum('bij,bj->bi', Ps[:, t * hetero], torch.exp(tmp - m[:, None]))) + m[:, None]
+    return betas
 
 @numba.jit(nopython=True, cache=True)
 def _compute_stationary_expected_joints(alphas, betas, lls, log_P, E_zzp1):
@@ -160,6 +199,17 @@ def _compute_stationary_expected_joints(alphas, betas, lls, log_P, E_zzp1):
         for i in range(K):
             for j in range(K):
                 E_zzp1[i, j] += tmp[i, j] / (tmpsum + DIV_EPS)
+
+
+# def _compute_stationary_expected_joints_3d(alphas, betas, lls, log_P, E_zzp1):
+#     B, T, K = alphas.shape
+
+#     assert betas.shape[1] == T and betas.shape[2] == K
+#     assert lls.shape[1] == T and lls.shape[2] == K
+#     assert log_P.shape[1] == K and log_P.shape[2] == K
+#     assert E_zzp1.shape[1] == K and E_zzp1.shape[2] == K
+
+#     tmp = torch.zeros((B, K, K), dtype=torch.double)
 
 
 def hmm_expected_states(pi0, Ps, ll):
@@ -206,6 +256,46 @@ def hmm_expected_states(pi0, Ps, ll):
     return expected_states, expected_joints, normalizer
 
 
+def hmm_expected_states_3d(pi0, Ps, ll):
+    # import pdb; pdb.set_trace()
+    B, T, K = ll.shape
+
+    alphas = torch.zeros((B, T, K), dtype=torch.double)
+    alphas = forward_pass_3d(pi0, Ps, ll, alphas)
+    normalizer = logsumexp_torch(alphas[:, -1])
+
+    betas = torch.zeros((B, T, K), dtype=torch.double)
+    betas = backward_pass_3d(Ps, ll, betas)
+
+    expected_states = alphas + betas
+    expected_states -= torch.logsumexp(expected_states, axis=2, keepdims=True)
+    expected_states = torch.exp(expected_states)
+
+    log_Ps = torch.log(Ps)
+
+    if (Ps.shape[1] != 1):
+        expected_joints = alphas[:,:-1,:,None] + betas[:,1:,None,:] + ll[:,1:,None,:] + log_Ps
+        expected_joints -= torch.amax(expected_joints, (2,3))[:,:,None,None]
+        expected_joints = torch.exp(expected_joints)
+        expected_joints /= torch.sum(expected_joints, (2,3))[:,:,None,None]
+    else:
+        expected_joints = alphas[:,:-1,:,None] + betas[:,1:,None,:] + ll[:,1:,None,:] + log_Ps
+        expected_joints -= torch.amax(expected_joints, (2,3))[:,:,None,None]
+        expected_joints = torch.exp(expected_joints)
+        expected_joints /= (torch.sum(expected_joints, (2,3))[:,:,None,None] + DIV_EPS)
+        expected_joints = torch.sum(expected_joints, 1, keepdim=True)
+    
+    # import pdb; pdb.set_trace()
+    # for i in range(expected_states.shape[0]):
+    #     es, ej, n = hmm_expected_states(pi0[i].cpu().numpy(), Ps[i].cpu().numpy(), ll[i].cpu().numpy())
+    #     nes, nej, nn = expected_states[i].cpu().numpy(), expected_joints[i].cpu().numpy(), normalizer[i].cpu().numpy()
+    #     for arr1, arr2 in zip([es, ej, n], [nes, nej, nn]):
+    #         diff = np.abs(arr1 - arr2)
+    #         if not np.all(diff < 1e-8):
+    #             import pdb; pdb.set_trace()
+
+    return expected_states, expected_joints, normalizer
+
 @numba.jit(nopython=True, cache=True)
 def backward_sample(Ps, log_likes, alphas, us, zs):
     T = log_likes.shape[0]
@@ -243,8 +333,45 @@ def backward_sample(Ps, log_likes, alphas, us, zs):
             lpzp1 = np.log(Ps[(t-1) * hetero, :, int(zs[t])] + LOG_EPS)
 
 
+def backward_sample_3d(Ps, log_likes, alphas, us, zs):
+    B, T, K = log_likes.shape
+    assert Ps.shape[1] == T-1 or Ps.shape[1] == 1
+    assert Ps.shape[2] == K
+    assert Ps.shape[3] == K
+    assert alphas.shape[1] == T
+    assert alphas.shape[2] == K
+    assert us.shape[1] == T
+    assert zs.shape[1] == T  
+
+    lpzp1 = torch.zeros((B,K), dtype=torch.double)
+    lpz = torch.zeros((B,K), dtype=torch.double)
+
+    hetero = (Ps.shape[1] == T-1)
+
+    for b in range(B):
+        for t in range(T-1,-1,-1):
+            # compute normalized log p(z[t] = k | z[t+1])
+            lpz[b] = lpzp1[b] + alphas[b,t]
+            Z = logsumexp_torch(lpz[b][None, :])[0]
+
+            # sample
+            acc = 0
+            zs[b,t] = K-1
+            for k in range(K):
+                acc += torch.exp(lpz[b,k] - Z)
+                if us[b,t] < acc:
+                    zs[b,t] = k
+                    break
+
+            # set the transition potential
+            if t > 0:
+                lpzp1[b] = torch.log(Ps[b, (t-1) * hetero, :, int(zs[t])] + LOG_EPS)
+    
+    return zs
+
+
 @numba.jit(nopython=True, cache=True)
-def _hmm_sample(pi0, Ps, ll):
+def _hmm_sample(pi0, Ps, ll, us=None):
     T, K = ll.shape
 
     # Forward pass gets the predicted state at time t given
@@ -253,11 +380,29 @@ def _hmm_sample(pi0, Ps, ll):
     forward_pass(pi0, Ps, ll, alphas)
 
     # Sample backward
-    us = npr.rand(T)
+    us = npr.rand(T) if us is None else us
     zs = -1 * np.ones(T)
     backward_sample(Ps, ll, alphas, us, zs)
     return zs
 
+
+def hmm_sample_3d(pi0, Ps, ll):
+    B, T, K = ll.shape
+
+    alphas = torch.zeros((B,T,K), dtype=torch.double)
+    alphas = forward_pass(pi0, Ps, ll, alphas)
+    
+    us = torch.tensor(npr.rand((B,T)))
+    zs = -1 * torch.ones((B,T), dtype=torch.double)
+    zs = backward_sample_3d(Ps, ll, alphas, us, zs)
+
+    # for i in range(B):
+    #     oldz = _hmm_sample(pi0[i].numpy(), Ps[i].numpy(), ll[i].numpy(), us[i].numpy())
+    #     newz = zs[i].numpy()
+    #     import pdb; pdb.set_trace()
+    #     diff = np.abs(newz - oldz)
+    #     assert np.all(diff < 1e-8)
+    return zs
 
 def hmm_sample(pi0, Ps, ll):
     return _hmm_sample(pi0, Ps, ll).astype(int)
@@ -371,6 +516,14 @@ def hmm_normalizer(pi0, Ps, ll):
 
     forward_pass(pi0, Ps, ll, alphas)
     return logsumexp(alphas[-1])
+
+
+def hmm_normalizer_3d(pi0, Ps, ll):
+    B, T, K = ll.shape
+    alphas = torch.zeros((B,T,K), dtype=torch.double)
+
+    alphas = forward_pass_3d(pi0, Ps, ll, alphas)
+    return torch.logsumexp(alphas[:,-1], dim=1)
 
 
 def _make_grad_hmm_normalizer(argnum, ans, pi0, Ps, ll):
@@ -943,6 +1096,15 @@ def _info_lognorm(J, h):
     return log_Z
 
 
+def _info_lognorm_3d(J, h):
+    D = h.shape[1]
+    # log_Z = 0.5 * torch.einsum('bd,bdi->b', h, torch.solve(h[:,:,None], J)[0])
+    log_Z = 0.5 * torch.einsum('bd,bdi->b', h, torch.linalg.solve(J, h[:,:,None]))
+    log_Z += -0.5 * torch.slogdet(J)[1]
+    log_Z += 0.5 * D * np.log(2 * np.pi)
+    return log_Z
+
+
 @numba.jit(nopython=True, cache=True)
 def _info_predict(J_filt, h_filt, J_11, J_21, J_22, h_1, h_2, log_Z_dyn, J_pred, h_pred):
     tmp_J = J_filt + J_11
@@ -965,6 +1127,14 @@ def _sample_info_gaussian(J, h, noise):
      sample += np.linalg.solve(J, h)
      return sample
 
+def _sample_info_gaussian_3d(J, h, noise):
+    # L = torch.cholesky(J)
+    L = torch.linalg.cholesky(J)
+    # sample = torch.solve(noise[:,:,None], L.permute(0, 2, 1))[0]
+    sample = torch.linalg.solve(L.permute(0, 2, 1), noise[:,:,None])
+    # sample += torch.solve(h[:,:,None], J)[0]
+    sample += torch.linalg.solve(J, h[:,:,None])
+    return torch.squeeze(sample)
 
 @numba.jit(nopython=True, cache=True)
 def _kalman_info_filter_with_predictions(
@@ -1024,6 +1194,58 @@ def _kalman_info_filter_with_predictions(
     return log_Z, filtered_Js, filtered_hs, predicted_Js, predicted_hs
 
 
+def _kalman_info_filter_with_predictions_3d(
+    J_ini, h_ini, log_Z_ini,
+    J_dyn_11, J_dyn_21, J_dyn_22, h_dyn_1, h_dyn_2, log_Z_dyn,
+    J_obs, h_obs, log_Z_obs):
+
+    B, T, D = h_obs.shape
+
+    # Allocate output arrays
+    filtered_Js = torch.zeros((B, T, D, D), dtype=torch.double)
+    filtered_hs = torch.zeros((B, T, D), dtype=torch.double)
+    predicted_Js = torch.zeros((B, T, D, D), dtype=torch.double)
+    predicted_hs = torch.zeros((B, T, D), dtype=torch.double)
+
+    predicted_Js[:, 0] = J_ini
+    predicted_hs[:, 0] = h_ini
+    log_Z = log_Z_ini
+
+    for t in range(T-1):
+        # Extract blocks of the dynamics potentials
+        J_11 = J_dyn_11[:, t] if J_dyn_11.shape[1] == T-1 else J_dyn_11[:,0]
+        J_21 = J_dyn_21[:, t] if J_dyn_21.shape[1] == T-1 else J_dyn_21[:,0]
+        J_22 = J_dyn_22[:, t] if J_dyn_22.shape[1] == T-1 else J_dyn_22[:,0]
+        h_1 = h_dyn_1[:, t] if h_dyn_1.shape[1] == T-1 else h_dyn_1[:,0]
+        h_2 = h_dyn_2[:, t] if h_dyn_2.shape[1] == T-1 else h_dyn_2[:,0]
+        log_Z_d = log_Z_dyn[:, t] if log_Z_dyn.shape[1] == T-1 else log_Z_dyn[:,0]
+        J_o = J_obs[:, t] if J_obs.shape[1] == T else J_obs[:,0]
+        h_o = h_obs[:, t] if h_obs.shape[1] == T else h_obs[:,0]
+        log_Z_o = log_Z_obs[:, t] if log_Z_obs.shape[1] == T else log_Z_obs[:, 0]
+
+        # Condition on the observed data
+        filtered_Js[:, t] = predicted_Js[:, t] + J_o
+        filtered_hs[:, t] = predicted_hs[:, t] + h_o
+        log_Z += log_Z_o[:, None]
+    
+        # Predict the next frame
+        tmp_J = filtered_Js[:, t] + J_11 # (B, D, D)
+        tmp_h = filtered_hs[:, t] + h_1 # (B, D)
+        # predicted_Js[:, t+1] = J_22 - torch.einsum('bij,bjk->bik', J_21, torch.solve(J_21.permute(0, 2, 1), tmp_J)[0])
+        # predicted_hs[:, t+1] = h_2 - torch.einsum('bij,bjk->bi', J_21, torch.solve(tmp_h[:,:,None], tmp_J)[0])
+        predicted_Js[:, t+1] = J_22 - torch.einsum('bij,bjk->bik', J_21, torch.linalg.solve(tmp_J, J_21.permute(0, 2, 1)))
+        predicted_hs[:, t+1] = h_2 - torch.einsum('bij,bjk->bi', J_21, torch.linalg.solve(tmp_J, tmp_h[:,:,None]))
+        log_Z += log_Z_d[:, None] + _info_lognorm_3d(tmp_J, tmp_h)[:, None]
+    
+    filtered_Js[:, -1] = predicted_Js[:, -1] + J_obs[:, -1]
+    filtered_hs[:, -1] = predicted_hs[:, -1] + h_obs[:, -1]
+    log_Z += log_Z_obs[:, -1][:, None]
+
+    log_Z += _info_lognorm_3d(filtered_Js[:, -1], filtered_hs[:, -1])[:, None]
+
+    return log_Z, filtered_Js, filtered_hs, predicted_Js, predicted_hs
+
+
 @numba.jit(nopython=True, cache=True)
 def _kalman_info_filter(
     J_ini, h_ini, log_Z_ini,
@@ -1042,7 +1264,7 @@ def _kalman_info_filter(
 #@numba.jit(nopython=True, cache=True)
 def _kalman_info_sample(J_ini, h_ini, log_Z_ini,
                        J_dyn_11, J_dyn_21, J_dyn_22, h_dyn_1, h_dyn_2, log_Z_dyn,
-                       J_obs, h_obs, log_Z_obs):
+                       J_obs, h_obs, log_Z_obs, noise=None):
     """
     Information form Kalman sampling for time-varying linear dynamical system with inputs.
     """
@@ -1056,7 +1278,7 @@ def _kalman_info_sample(J_ini, h_ini, log_Z_ini,
 
     # Allocate output arrays
     samples = np.zeros((T, D))
-    noise = npr.randn(T, D)
+    noise = npr.randn(T, D) if noise is None else noise
 
     # Initialize with samples of the last state
     samples[-1] = _sample_info_gaussian(filtered_Js[-1], filtered_hs[-1], noise[-1])
@@ -1072,6 +1294,43 @@ def _kalman_info_sample(J_ini, h_ini, log_Z_ini,
         J_post = filtered_Js[t] + J_11
         h_post = filtered_hs[t] + h_1 - np.dot(J_21.T, samples[t+1])
         samples[t] = _sample_info_gaussian(J_post, h_post, noise[t])
+
+    return samples
+
+
+def kalman_info_sample_3d(J_ini, h_ini, log_Z_ini,
+                       J_dyn_11, J_dyn_21, J_dyn_22, h_dyn_1, h_dyn_2, log_Z_dyn,
+                       J_obs, h_obs, log_Z_obs):
+    B, T, D = h_obs.shape
+    log_Z, filtered_Js, filtered_hs, *_ = _kalman_info_filter_with_predictions_3d(
+        J_ini, h_ini, log_Z_ini,
+        J_dyn_11, J_dyn_21, J_dyn_22, h_dyn_1, h_dyn_2, log_Z_dyn,
+        J_obs, h_obs, log_Z_obs)
+    
+    samples = torch.zeros((B, T, D), dtype=torch.double)
+    noise = torch.tensor(npr.randn(B, T, D))
+
+    samples[:, -1] = _sample_info_gaussian_3d(filtered_Js[:, -1], filtered_hs[:, -1], noise[:, -1])
+
+    for t in range(T-2, -1, -1):
+        # Extract blocks of the dynamics potentials
+        J_11 = J_dyn_11[:,t] if J_dyn_11.shape[1] == T-1 else J_dyn_11[:,0]
+        J_21 = J_dyn_21[:,t] if J_dyn_21.shape[1] == T-1 else J_dyn_21[:,0]
+        h_1 = h_dyn_1[:,t] if h_dyn_1.shape[1] == T-1 else h_dyn_1[:,0]
+
+        # Condition on the next observation
+        J_post = filtered_Js[:,t] + J_11
+        h_post = filtered_hs[:,t] + h_1 - torch.einsum('bij,bj->bi', J_21.permute(0,2,1), samples[:,t+1])
+        samples[:,t] = _sample_info_gaussian_3d(J_post, h_post, noise[:,t])
+    
+    # for i in range(J_ini.shape[0]):
+    #     oldsamp = _kalman_info_sample(J_ini[i].numpy(), h_ini[i].numpy(), log_Z_ini[i].numpy(),
+    #                    J_dyn_11[i].numpy(), J_dyn_21[i].numpy(), J_dyn_22[i].numpy(), h_dyn_1[i].numpy(), h_dyn_2[i].numpy(), log_Z_dyn[i].numpy(),
+    #                    J_obs[i].numpy(), h_obs[i].numpy(), log_Z_obs[i].numpy(), noise=noise[i].numpy())
+    #     newsamp = samples[i].numpy()
+    #     # import pdb; pdb.set_trace()
+    #     diff = np.abs(newsamp - oldsamp)
+    #     assert np.all(diff < 1e-8)
 
     return samples
 
@@ -1146,6 +1405,63 @@ def _kalman_info_smoother(J_ini, h_ini, log_Z_ini,
 
     return log_Z, smoothed_mus, smoothed_Sigmas, ExxnT
 
+
+def kalman_info_smoother_3d(J_ini, h_ini, log_Z_ini,
+                         J_dyn_11, J_dyn_21, J_dyn_22, h_dyn_1, h_dyn_2, log_Z_dyn,
+                         J_obs, h_obs, log_Z_obs,):
+    B, T, D = h_obs.shape
+
+    log_Z, filtered_Js, filtered_hs, predicted_Js, predicted_hs = \
+        _kalman_info_filter_with_predictions_3d(
+            J_ini, h_ini, log_Z_ini,
+            J_dyn_11, J_dyn_21, J_dyn_22, h_dyn_1, h_dyn_2, log_Z_dyn,
+            J_obs, h_obs, log_Z_obs)
+
+    # Allocate output arrays
+    smoothed_Js = torch.zeros((B, T, D, D), dtype=torch.double)
+    smoothed_hs = torch.zeros((B, T, D), dtype=torch.double)
+    smoothed_mus = torch.zeros((B, T, D), dtype=torch.double)
+    smoothed_Sigmas = torch.zeros((B, T, D, D), dtype=torch.double)
+    ExxnT = torch.zeros((B, T-1, D, D), dtype=torch.double)
+
+    # Initialize
+    smoothed_Js[:, -1] = filtered_Js[:, -1]
+    smoothed_hs[:, -1] = filtered_hs[:, -1]
+    smoothed_Sigmas[:, -1] = torch.inverse(smoothed_Js[:, -1])
+    smoothed_mus[:, -1] = torch.einsum('bij,bj->bi', smoothed_Sigmas[:, -1], smoothed_hs[:, -1])
+
+    for t in range(T-2, -1, -1):
+        J_11 = J_dyn_11[:,t] if J_dyn_11.shape[1] == T-1 else J_dyn_11[:,0]
+        J_21 = J_dyn_21[:,t] if J_dyn_21.shape[1] == T-1 else J_dyn_21[:,0]
+        J_22 = J_dyn_22[:,t] if J_dyn_22.shape[1] == T-1 else J_dyn_22[:,0]
+        h_1 = h_dyn_1[:,t] if h_dyn_1.shape[1] == T-1 else h_dyn_1[:,0]
+        h_2 = h_dyn_2[:,t] if h_dyn_2.shape[1] == T-1 else h_dyn_2[:,0]
+
+        J_inner = smoothed_Js[:, t+1] - predicted_Js[:, t+1] + J_22
+        h_inner = smoothed_hs[:, t+1] - predicted_hs[:, t+1] + h_2
+        # smoothed_Js[:, t] = filtered_Js[:, t] + J_11 - torch.einsum('bij,bjk->bik', J_21.permute(0, 2, 1), torch.solve(J_21, J_inner)[0])
+        # smoothed_hs[:, t] = filtered_hs[:, t] + h_1 - torch.einsum('bij,bjk->bi', J_21.permute(0, 2, 1), torch.solve(h_inner[:,:,None], J_inner)[0])
+        smoothed_Js[:, t] = filtered_Js[:, t] + J_11 - torch.einsum('bij,bjk->bik', J_21.permute(0, 2, 1), torch.linalg.solve(J_inner, J_21))
+        smoothed_hs[:, t] = filtered_hs[:, t] + h_1 - torch.einsum('bij,bjk->bi', J_21.permute(0, 2, 1), torch.linalg.solve(J_inner, h_inner[:,:,None]))
+
+        smoothed_Sigmas[:,t] = torch.inverse(smoothed_Js[:,t])
+        smoothed_mus[:,t] = torch.einsum('bij,bj->bi', smoothed_Sigmas[:,t], smoothed_hs[:,t])
+
+        # ExxnT[:,t] = -torch.solve(torch.einsum('bij,bjk->bik', J_21.permute(0, 2, 1), smoothed_Sigmas[:,t+1]), filtered_Js[:,t] + J_11)[0]
+        ExxnT[:,t] = -torch.linalg.solve(filtered_Js[:,t] + J_11, torch.einsum('bij,bjk->bik', J_21.permute(0, 2, 1), smoothed_Sigmas[:,t+1]))
+        ExxnT[:,t] += torch.einsum('bi,bj->bij', smoothed_mus[:, t], smoothed_mus[:, t+1])
+    
+    # for i in range(log_Z.shape[0]):
+    #     lz, sm, ss, exxnt = _kalman_info_smoother(J_ini[i].cpu().numpy(), h_ini[i].cpu().numpy(), log_Z_ini[i].cpu().numpy(),
+    #                      J_dyn_11[i].cpu().numpy(), J_dyn_21[i].cpu().numpy(), J_dyn_22[i].cpu().numpy(), h_dyn_1[i].cpu().numpy(), h_dyn_2[i].cpu().numpy(), log_Z_dyn[i].cpu().numpy(),
+    #                      J_obs[i].cpu().numpy(), h_obs[i].cpu().numpy(), log_Z_obs[i].cpu().numpy(),)
+    #     nlz, nsm, nss, nexxnt = log_Z[i].cpu().numpy(), smoothed_mus[i].cpu().numpy(), smoothed_Sigmas[i].cpu().numpy(), ExxnT[i].cpu().numpy()
+    #     # import pdb; pdb.set_trace()
+    #     for arr1, arr2 in zip([lz, sm, ss, exxnt], [nlz, nsm, nss, nexxnt]):
+    #         diff = np.abs(arr1 - arr2)
+    #         assert np.all(diff < 1e-8)
+
+    return log_Z, smoothed_mus, smoothed_Sigmas, ExxnT
 
 def kalman_info_wrapper(f):
     """

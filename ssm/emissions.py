@@ -7,10 +7,12 @@ from autograd import hessian
 
 from ssm.util import ensure_args_are_lists, \
     logistic, logit, softplus, inv_softplus
-from ssm.preprocessing import interpolate_data, pca_with_imputation
+from ssm.preprocessing import interpolate_data, interpolate_data_3d, pca_with_imputation
 from ssm.optimizers import adam, bfgs, rmsprop, sgd, lbfgs
 from ssm.stats import independent_studentst_logpdf, bernoulli_logpdf
 from ssm.regression import fit_linear_regression
+
+import torch
 
 # Observation models for SLDS
 class Emissions(object):
@@ -80,15 +82,26 @@ class Emissions(object):
         """
         optimizer = dict(adam=adam, bfgs=bfgs, lbfgs=lbfgs, rmsprop=rmsprop, sgd=sgd)[optimizer]
 
+        def _get_obj(discrete_expectations, continuous_expectations):
+            obj = self.log_prior()
+            lls = self.log_likelihoods_3d(datas, inputs, masks, tags, continuous_expectations)#, m_step=True)
+            # obj += np.sum(discrete_expectations[0].cpu().numpy() * lls)
+            obj += torch.sum(discrete_expectations[0] * lls)
+            return obj
+
         # expected log likelihood
         T = sum([data.shape[0] for data in datas])
         def _objective(params, itr):
             self.params = params
-            obj = 0
-            obj += self.log_prior()
-            for data, input, mask, tag, x, (Ez, _, _) in \
-                zip(datas, inputs, masks, tags, continuous_expectations, discrete_expectations):
-                obj += np.sum(Ez * self.log_likelihoods(data, input, mask, tag, x))
+            # obj = 0
+            # obj += self.log_prior()
+            # for data, input, mask, tag, x, Ez in \
+            #     zip(datas, inputs, masks, tags, continuous_expectations, discrete_expectations[0]):
+            #     obj += np.sum(Ez.numpy() * self.log_likelihoods(data.numpy().astype(int), input.numpy(), mask.numpy(), tag, x.numpy()))
+            # lls = self.log_likelihoods_3d(datas, inputs, masks, tags, continuous_expectations, m_step=False).cpu().numpy()
+            # obj += np.sum(discrete_expectations[0].cpu().numpy() * lls)
+            # assert np.abs(obj - obj2) < 1e-6, "fail"
+            obj = _get_obj(discrete_expectations, continuous_expectations)
             return -obj / T
 
         # Optimize emissions log-likelihood
@@ -113,9 +126,12 @@ class _LinearEmissions(Emissions):
 
         # Initialize linear layer.  Set _Cs to be private so that it can be
         # changed in subclasses.
-        self._Cs = npr.randn(1, N, D) if single_subspace else npr.randn(K, N, D)
-        self.Fs = npr.randn(1, N, M) if single_subspace else npr.randn(K, N, M)
-        self.ds = npr.randn(1, N) if single_subspace else npr.randn(K, N)
+        self._Cs = torch.tensor(npr.randn(1, N, D) if single_subspace else npr.randn(K, N, D))
+        self.Fs = torch.tensor(npr.randn(1, N, M) if single_subspace else npr.randn(K, N, M))
+        self.ds = torch.tensor(npr.randn(1, N) if single_subspace else npr.randn(K, N))
+        # self._Cs = npr.randn(1, N, D) if single_subspace else npr.randn(K, N, D)
+        # self.Fs = npr.randn(1, N, M) if single_subspace else npr.randn(K, N, M)
+        # self.ds = npr.randn(1, N) if single_subspace else npr.randn(K, N)
 
     @property
     def Cs(self):
@@ -149,32 +165,81 @@ class _LinearEmissions(Emissions):
         xhat = (C^T C)^{-1} C^T (y-d)
         """
         # Invert with the average emission parameters
-        C = np.mean(self.Cs, axis=0)
-        F = np.mean(self.Fs, axis=0)
-        d = np.mean(self.ds, axis=0)
-        C_pseudoinv = np.linalg.solve(C.T.dot(C), C.T).T
+        assert self.M == 0, "inputs not supported"
+        # C = torch.mean(torch.tensor(self.Cs, device=data.device), axis=0)
+        C = torch.mean(self.Cs, axis=0)
+        # F = torch.mean(torch.tensor(self.Fs, device=data.device), axis=0)
+        # d = torch.mean(torch.tensor(self.ds, device=data.device), axis=0)
+        d = torch.mean(self.ds, axis=0)
+        # C_pseudoinv = torch.solve(C.T, C.T @ C)[0].T
+        C_pseudoinv = torch.linalg.solve(C.T @ C, C.T).T
 
         # Account for the bias
-        bias = input.dot(F.T) + d
+        # bias = (input @ F.T) + d
+        bias = d
 
-        if not np.all(mask):
-            data = interpolate_data(data, mask)
+        if not torch.all(mask):
+            if len(data.shape) == 3:
+                data = interpolate_data_3d(data, mask)
+                temp_mask = mask[:, 0:1, :].repeat(1, mask.shape[1], 1)
+                for itr in range(25):
+                    mu = (data - bias) @ (C_pseudoinv)
+                    data[~temp_mask] = (mu @ (C.T) + bias)[~temp_mask]
+            elif len(data.shape) == 2:
+                data = interpolate_data(data, mask)
+                for itr in range(25):
+                    mu = (data - bias) @ (C_pseudoinv)
+                    data[:, ~mask[0]] = (mu @ (C.T) + bias)[:, ~mask[0]]
+            else:
+                raise NotImplementedError
             # We would like to find the PCA coordinates in the face of missing data
             # To do so, alternate between running PCA and imputing the missing entries
-            for itr in range(25):
-                mu = (data - bias).dot(C_pseudoinv)
-                data[:, ~mask[0]] = (mu.dot(C.T) + bias)[:, ~mask[0]]
+            # for itr in range(25):
+            #     mu = (data - bias) @ (C_pseudoinv)
+            #     data[:, :, ~mask[0]] = (mu @ (C.T) + bias)[:, :, ~mask[0]]
 
         # Project data to get the mean
-        return (data - bias).dot(C_pseudoinv)
+        return (data - bias) @ (C_pseudoinv)
 
     def forward(self, x, input, tag):
-        return np.matmul(self.Cs[None, ...], x[:, None, :, None])[:, :, :, 0] \
-            + np.matmul(self.Fs[None, ...], input[:, None, :, None])[:, :, :, 0] \
-            + self.ds
+        Cs = self.Cs.cpu().numpy() if isinstance(self.Cs, torch.Tensor) else self.Cs
+        Fs = self.Fs.cpu().numpy() if isinstance(self.Fs, torch.Tensor) else self.Fs
+        ds = self.ds.cpu().numpy() if isinstance(self.ds, torch.Tensor) else self.ds
+        return np.matmul(Cs[None, ...], x[:, None, :, None])[:, :, :, 0] \
+            + np.matmul(Fs[None, ...], input[:, None, :, None])[:, :, :, 0] \
+            + ds
 
-    @ensure_args_are_lists
+    def forward_3d(self, xs, inputs, tags, m_step=False):
+        B = len(xs)
+        # Cs (1, N, D) -> (1, 1, N, D)
+        # x (T, D) -> (T, 1, D, 1)
+        # Cs @ x -> (T, 1, N, 1) -> (T, 1, N)
+
+        # Fs (1, N, M) -> (1, 1, N, M)
+        # input (T, M) -> (T, 1, M, 1)
+        # Fs @ input -> (T, 1, N, 1) -> (T, 1, N)
+        
+        # ds (1, N)
+        assert self.M == 0, "inputs not supported"
+        if m_step:
+            xs = xs[:, :, None, :, None].detach().cpu().numpy()
+            return (self.Cs @ xs)[:, :, :, :, 0] + self.ds
+        elif isinstance(self.Cs, np.numpy_boxes.ArrayBox):
+            Cs = torch.tensor(self.Cs._value[None, None, ...], device=xs.device)
+            ds = torch.tensor(self.ds._value, device=xs.device)
+            xs = xs[:, :, None, :, None]
+            return (Cs @ xs)[:, :, :, :, 0] + ds
+        else:
+            # Cs = torch.tensor(self.Cs[None, None, ...], device=xs.device)
+            Cs = self.Cs[None, None, ...]
+            # ds = torch.tensor(self.ds, device=xs.device)
+            ds = self.ds
+            xs = xs[:, :, None, :, None]
+            return (Cs @ xs)[:, :, :, :, 0] + ds
+
+    # @ensure_args_are_lists
     def _initialize_with_pca(self, datas, inputs=None, masks=None, tags=None, num_iters=20):
+        assert self.M == 0, "inputs not supported"
         Keff = 1 if self.single_subspace else self.K
 
         # First solve a linear regression for data given input
@@ -185,7 +250,8 @@ class _LinearEmissions(Emissions):
             self.Fs = np.tile(lr.coef_[None, :, :], (Keff, 1, 1))
 
         # Compute residual after accounting for input
-        resids = [data - np.dot(input, self.Fs[0].T) for data, input in zip(datas, inputs)]
+        # resids = [data - np.dot(input, self.Fs[0].T) for data, input in zip(datas, inputs)]
+        resids = datas
 
         # Run PCA to get a linear embedding of the data with the maximum effective dimension
         pca, xs, ll = pca_with_imputation(min(self.D * Keff, self.N),
@@ -200,8 +266,10 @@ class _LinearEmissions(Emissions):
             ds.append(pca.mean_)
 
         # Find the components with the largest power
-        self.Cs = np.array(Cs)
-        self.ds = np.array(ds)
+        self.Cs = torch.tensor(np.array(Cs))
+        self.ds = torch.tensor(np.array(ds))
+        # self.Cs = np.array(Cs)
+        # self.ds = np.array(ds)
 
         return pca
 
@@ -660,19 +728,32 @@ class _PoissonEmissionsMixin(object):
 
         # Set the bias to be small if using log link
         if link == "log":
-            self.ds = -3 + .5 * npr.randn(1, N) if single_subspace else npr.randn(K, N)
+            self.ds = torch.tensor(-3 + .5 * npr.randn(1, N) if single_subspace else npr.randn(K, N))
+            # self.ds = -3 + .5 * npr.randn(1, N) if single_subspace else npr.randn(K, N)
 
     def _log_mean(self, x):
-        return np.exp(x) * self.bin_size
+        if isinstance(x, torch.Tensor):
+            return torch.exp(x) * self.bin_size
+        else:
+            return np.exp(x) * self.bin_size
 
     def _softplus_mean(self, x):
-        return softplus(x) * self.bin_size
+        if isinstance(x, torch.Tensor):
+            return torch.log1p(torch.exp(x)) * self.bin_size
+        else:
+            return softplus(x) * self.bin_size
 
     def _log_link(self, rate):
-        return np.log(rate) - np.log(self.bin_size)
+        if isinstance(rate, torch.Tensor):
+            return torch.log(rate) - np.log(self.bin_size)
+        else:
+            return np.log(rate) - np.log(self.bin_size)
 
     def _softplus_link(self, rate):
-        return inv_softplus(rate / self.bin_size)
+        if isinstance(rate, torch.Tensor):
+            return torch.log(torch.exp(rate / self.bin_size) - 1)
+        else:
+            return inv_softplus(rate / self.bin_size)
 
     def log_likelihoods(self, data, input, mask, tag, x):
         assert data.dtype == int
@@ -681,8 +762,22 @@ class _PoissonEmissionsMixin(object):
         lls = -gammaln(data[:,None,:] + 1) -lambdas + data[:,None,:] * np.log(lambdas)
         return np.sum(lls * mask[:, None, :], axis=2)
 
+    def log_likelihoods_3d(self, datas, inputs, masks, tags, xs, m_step=False):
+        assert datas.dtype == torch.int
+        if m_step:
+            lambdas = self.mean(self.forward_3d(xs, inputs, tags, m_step=m_step))
+            datas = datas.cpu().numpy()
+            masks = torch.ones(datas.shape, dtype=bool) if masks is None else masks.cpu().numpy()
+            lls = -gammaln(datas[:,:,None,:] + 1) -lambdas + datas[:,:,None,:] * np.log(lambdas)
+            return np.sum(lls * masks[:, :, None, :], axis=3)
+        else:
+            lambdas = self.mean(self.forward_3d(xs, inputs, tags, m_step=m_step))
+            masks = torch.ones_like(datas, dtype=torch.bool) if masks is None else masks
+            lls = -torch.tensor(gammaln(datas[:,:,None,:].cpu().numpy() + 1), device=datas.device) -lambdas + datas[:,:,None,:] * torch.log(lambdas)
+            return torch.sum(lls * masks[:, :, None, :], axis=3)
+
     def invert(self, data, input=None, mask=None, tag=None):
-        yhat = self.link(np.clip(data, .1, np.inf))
+        yhat = self.link(torch.tensor(np.clip(data.cpu().numpy(), .1, np.inf), device=data.device))
         return self._invert(yhat, input=input, mask=mask, tag=tag)
 
     def sample(self, z, x, input=None, tag=None):
@@ -695,6 +790,10 @@ class _PoissonEmissionsMixin(object):
     def smooth(self, expected_states, variational_mean, data, input=None, mask=None, tag=None):
         lambdas = self.mean(self.forward(variational_mean, input, tag))
         return lambdas[:,0,:] if self.single_subspace else np.sum(lambdas * expected_states[:,:,None], axis=1)
+    
+    def smooth_3d(self, expected_states, variational_mean, datas, inputs, masks, tags):
+        lambdas = self.mean(self.forward_3d(variational_mean, inputs, tags))
+        return lambdas[:,:,0,:] if self.single_subspace else torch.sum(lambdas * expected_states[:,:,:,None], dim=2)
 
 class PoissonEmissions(_PoissonEmissionsMixin, _LinearEmissions):
     def __init__(self, N, K, D, M=0, single_subspace=True, **kwargs):
@@ -702,14 +801,23 @@ class PoissonEmissions(_PoissonEmissionsMixin, _LinearEmissions):
         # Scale down the measurement and control matrices so that
         # rate params don't explode when exponentiated.
         if self.link_name == "log":
-            self.Cs /= np.exp(np.linalg.norm(self.Cs, axis=2)[:,:,None])
-            self.Fs /= np.exp(np.linalg.norm(self.Fs, axis=2)[:,:,None])
+            # self.Cs /= np.exp(np.linalg.norm(self.Cs, axis=2)[:,:,None])
+            # self.Fs /= np.exp(np.linalg.norm(self.Fs, axis=2)[:,:,None])
+            self.Cs /= torch.exp(torch.norm(self.Cs, dim=2)[:,:,None])
+            self.Fs /= torch.exp(torch.norm(self.Fs, dim=2)[:,:,None])
 
-    @ensure_args_are_lists
     def initialize(self, datas, inputs=None, masks=None, tags=None):
-        datas = [interpolate_data(data, mask) for data, mask in zip(datas, masks)]
-        yhats = [self.link(np.clip(d, .1, np.inf)) for d in datas]
+        # datas = [interpolate_data(data, mask) for data, mask in zip(datas, masks)]
+        # yhats = [self.link(np.clip(d, .1, np.inf)) for d in datas]
+        # self._initialize_with_pca(yhats, inputs=inputs, masks=masks, tags=tags)
+
+        # datastack = np.stack(datas)
+        # if masks is not None:
+            # maskstack = np.stack(masks)
+        datas = interpolate_data_3d(datas, masks)
+        yhats = self.link(torch.tensor(np.clip(datas.cpu().numpy(), .1, np.inf), device=datas.device))
         self._initialize_with_pca(yhats, inputs=inputs, masks=masks, tags=tags)
+        
 
     def neg_hessian_log_emissions_prob(self, data, input, mask, tag, x, Ez):
         """
@@ -742,7 +850,17 @@ class PoissonEmissions(_PoissonEmissionsMixin, _LinearEmissions):
 
         else:
             raise Exception("No Hessian calculation for link: {}".format(self.link_name))
-
+    
+    def neg_hessian_log_emissions_prob_3d(self, datas, inputs, masks, tags, xs, Ezs):
+        assert self.single_subspace, "single subspace required"
+        # if self.link_name != 'log':
+        #     raise NotImplementedError
+        
+        lambdas = self.mean(self.forward_3d(xs, inputs, tags))
+        C = self.Cs[0]
+        # C = torch.tensor(self.Cs[0], device=datas.device)
+        hess = torch.einsum('btn,ni,nj->btij', -lambdas[:, :, 0, :], C, C)
+        return -1 * hess
 
 class PoissonOrthogonalEmissions(_PoissonEmissionsMixin, _OrthogonalLinearEmissions):
     @ensure_args_are_lists

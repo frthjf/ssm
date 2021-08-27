@@ -2,12 +2,15 @@ import autograd.numpy as np
 import autograd.numpy.random as npr
 
 from ssm.primitives import lds_log_probability, lds_sample, lds_mean
-from ssm.messages import hmm_expected_states, hmm_sample, kalman_info_sample, kalman_info_smoother
+from ssm.messages import hmm_expected_states, hmm_sample, kalman_info_sample, kalman_info_smoother, \
+    hmm_expected_states_3d, kalman_info_smoother_3d, hmm_sample_3d, kalman_info_sample_3d
 
 from ssm.util import ensure_variational_args_are_lists, trace_product
 
 from autograd.scipy.special import logsumexp
 from warnings import warn
+
+import torch
 
 
 class VariationalPosterior(object):
@@ -50,7 +53,7 @@ class VariationalPosterior(object):
     A variational posterior must support sampling and point-wise
     evaluation in order to be used for the reparameterization trick.
     """
-    @ensure_variational_args_are_lists
+    # @ensure_variational_args_are_lists
     def __init__(self, model, datas, inputs=None, masks=None, tags=None):
         """
         Initialize the posterior with a ref to the model and datas,
@@ -251,7 +254,7 @@ class SLDSStructuredMeanFieldVariationalPosterior(VariationalPosterior):
     J_obs:     (T, D, D)    observation precision
     h_obs:     (T, D)       observation bias
     """
-    @ensure_variational_args_are_lists
+    # @ensure_variational_args_are_lists
     def __init__(self, model, datas,
                  inputs=None, masks=None, tags=None,
                  initial_variance=0.01):
@@ -267,15 +270,17 @@ class SLDSStructuredMeanFieldVariationalPosterior(VariationalPosterior):
 
         self._discrete_state_params = None
         self._discrete_expectations = None
-        self.discrete_state_params = \
-            [self._initialize_discrete_state_params(data, input, mask, tag)
-             for data, input, mask, tag in zip(datas, inputs, masks, tags)]
+        # self.discrete_state_params = \
+        #     [self._initialize_discrete_state_params(data, input, mask, tag)
+        #      for data, input, mask, tag in zip(datas, inputs, masks, tags)]
+        self.discrete_state_params = self._initialize_discrete_state_params_3d(datas, inputs, masks, tags)
 
         self._continuous_state_params = None
         self._continuous_expectations = None
-        self.continuous_state_params = \
-            [self._initialize_continuous_state_params(data, input, mask, tag)
-             for data, input, mask, tag in zip(datas, inputs, masks, tags)]
+        # self.continuous_state_params = \
+        #     [self._initialize_continuous_state_params(data, input, mask, tag)
+        #      for data, input, mask, tag in zip(datas, inputs, masks, tags)]
+        self.continuous_state_params = self._initialize_continuous_state_params_3d(datas, inputs, masks, tags)
 
     # Parameters
     @property
@@ -288,16 +293,33 @@ class SLDSStructuredMeanFieldVariationalPosterior(VariationalPosterior):
 
     @discrete_state_params.setter
     def discrete_state_params(self, value):
-        assert isinstance(value, list) and len(value) == len(self.datas)
-        for prms in value:
-            for key in ["pi0", "Ps", "log_likes"]:
-                assert key in prms
+        # assert isinstance(value, list) and len(value) == len(self.datas)
+        # for prms in value:
+        #     for key in ["pi0", "Ps", "log_likes"]:
+        #         assert key in prms
+        assert isinstance(value, dict)
+        for key in ['pi0', 'Ps', 'log_likes']:
+            assert key in value
         self._discrete_state_params = value
 
         # Rerun the HMM smoother with the updated parameters
-        self._discrete_expectations = \
-            [hmm_expected_states(prms["pi0"], prms["Ps"], prms["log_likes"])
-             for prms in self._discrete_state_params]
+        # self._discrete_expectations = \
+        #     [hmm_expected_states(prms["pi0"], prms["Ps"], prms["log_likes"])
+        #      for prms in self._discrete_state_params]
+            
+        # pi0 = torch.tensor(np.stack([prms['pi0'] for prms in self._discrete_state_params]))
+        # Ps = torch.tensor(np.stack([prms['Ps'] for prms in self._discrete_state_params]))
+        # log_likes = torch.tensor(np.stack([prms['log_likes'] for prms in self._discrete_state_params]))
+        self._discrete_expectations = hmm_expected_states_3d(
+            self._discrete_state_params['pi0'], 
+            self._discrete_state_params['Ps'],
+            self._discrete_state_params['log_likes']
+        )
+
+        # for i in range(len(self._discrete_expectations)):
+        #     assert np.all(np.abs(Ezs[i].cpu().numpy() - self._discrete_expectations[i][0]) < 1e-8)
+        #     assert np.all(np.abs(Ezzp1s[i].cpu().numpy() - self._discrete_expectations[i][1]) < 1e-8)
+        #     assert np.all(np.abs(norm[i].cpu().numpy() - self._discrete_expectations[i][2]) < 1e-8)
 
     @property
     def continuous_state_params(self):
@@ -305,21 +327,40 @@ class SLDSStructuredMeanFieldVariationalPosterior(VariationalPosterior):
 
     @continuous_state_params.setter
     def continuous_state_params(self, value):
-        assert isinstance(value, list) and len(value) == len(self.datas)
-        for prms in value:
-            for key in ["J_ini", "J_dyn_11", "J_dyn_21", "J_dyn_22", "J_obs",
-                        "h_ini", "h_dyn_1", "h_dyn_2", "h_obs"]:
-                assert key in prms
+        # assert isinstance(value, list) and len(value) == len(self.datas)
+        # for prms in value:
+        #     for key in ["J_ini", "J_dyn_11", "J_dyn_21", "J_dyn_22", "J_obs",
+        #                 "h_ini", "h_dyn_1", "h_dyn_2", "h_obs"]:
+        #         assert key in prms
+        assert isinstance(value, dict)
+        for key in ["J_ini", "J_dyn_11", "J_dyn_21", "J_dyn_22", "J_obs",
+                    "h_ini", "h_dyn_1", "h_dyn_2", "h_obs"]:
+            assert key in value
         self._continuous_state_params = value
 
         # Rerun the Kalman smoother with the updated parameters
+        # self._continuous_expectations = \
+        #     [kalman_info_smoother(prms["J_ini"], prms["h_ini"], 0,
+        #                           prms["J_dyn_11"], prms["J_dyn_21"], prms["J_dyn_22"],
+        #                           prms["h_dyn_1"], prms["h_dyn_2"], 0,
+        #                           prms["J_obs"], prms["h_obs"], 0)
+        #      for prms in self._continuous_state_params]
+            
+        # kwargs = {}
+        # for key in ["J_ini", "J_dyn_11", "J_dyn_21", "J_dyn_22", "J_obs",
+        #             "h_ini", "h_dyn_1", "h_dyn_2", "h_obs"]:
+        #     kwargs[key] = torch.tensor(np.stack([prms[key] for prms in self._continuous_state_params]))
+        log_Z_ini = torch.zeros((self.datas.shape[0], 1), dtype=torch.double)
+        log_Z_dyn = torch.zeros((self.datas.shape[0], 1), dtype=torch.double)
+        log_Z_obs = torch.zeros((self.datas.shape[0], 1), dtype=torch.double)
         self._continuous_expectations = \
-            [kalman_info_smoother(prms["J_ini"], prms["h_ini"], 0,
-                                  prms["J_dyn_11"], prms["J_dyn_21"], prms["J_dyn_22"],
-                                  prms["h_dyn_1"], prms["h_dyn_2"], 0,
-                                  prms["J_obs"], prms["h_obs"], 0)
-             for prms in self._continuous_state_params]
+            kalman_info_smoother_3d(log_Z_ini=log_Z_ini, log_Z_dyn=log_Z_dyn, log_Z_obs=log_Z_obs, **self._continuous_state_params)
 
+        # for i in range(len(self._continuous_expectations)):
+        #     assert np.all(np.abs(log_Z[i,0].cpu().numpy() - self._continuous_expectations[i][0]) < 1e-8)
+        #     assert np.all(np.abs(smoothed_mus[i].cpu().numpy() - self._continuous_expectations[i][1]) < 1e-8)
+        #     assert np.all(np.abs(smoothed_Sigmas[i].cpu().numpy() - self._continuous_expectations[i][2]) < 1e-8)
+        #     assert np.all(np.abs(ExxnT[i].cpu().numpy() - self._continuous_expectations[i][3]) < 1e-8)
 
     def _initialize_discrete_state_params(self, data, input, mask, tag):
         T = data.shape[0]
@@ -329,6 +370,15 @@ class SLDSStructuredMeanFieldVariationalPosterior(VariationalPosterior):
         pi0 = np.ones(K) / K
         Ps = np.ones((T-1, K, K)) / K
         log_likes = np.zeros((T, K))
+        return dict(pi0=pi0, Ps=Ps, log_likes=log_likes)
+    
+    def _initialize_discrete_state_params_3d(self, datas, inputs, masks, tags):
+        B, T, _ = datas.shape
+        K = self.K
+
+        pi0 = torch.ones((B,K), dtype=torch.double) / K
+        Ps = torch.ones((B,T-1,K,K), dtype=torch.double) / K
+        log_likes = torch.zeros((B,T,K), dtype=torch.double)
         return dict(pi0=pi0, Ps=Ps, log_likes=log_likes)
 
     def _initialize_continuous_state_params(self, data, input, mask, tag):
@@ -341,14 +391,14 @@ class SLDSStructuredMeanFieldVariationalPosterior(VariationalPosterior):
         h_dyn_2 = np.zeros((T - 1, D))
 
         # Set the posterior mean based on the emission model, if possible.
-        try:
-            h_obs = (1.0 / self.initial_variance) * self.model.emissions. \
-                invert(data, input=input, mask=mask, tag=tag)
-        except:
-            warn("We can only initialize the continuous states if the emissions support "
-                 "\"inverting\" the observations by mapping them to an estimate of the "
-                 "latent states. Defaulting to a random initialization instead.")
-            h_obs = (1.0 / self.initial_variance) * np.random.randn(data.shape[0], self.D)
+        # try:
+        h_obs = (1.0 / self.initial_variance) * self.model.emissions. \
+                invert(data, input=input, mask=mask, tag=tag).cpu().numpy()
+        # except:
+        #     warn("We can only initialize the continuous states if the emissions support "
+        #          "\"inverting\" the observations by mapping them to an estimate of the "
+        #          "latent states. Defaulting to a random initialization instead.")
+        #     h_obs = (1.0 / self.initial_variance) * np.random.randn(data.shape[0], self.D)
 
         # Initialize the posterior variance to self.initial_variance * I
         J_ini = np.zeros((D, D))
@@ -366,6 +416,33 @@ class SLDSStructuredMeanFieldVariationalPosterior(VariationalPosterior):
                     h_dyn_2=h_dyn_2,
                     J_obs=J_obs,
                     h_obs=h_obs)
+    
+    def _initialize_continuous_state_params_3d(self, datas, inputs, masks, tags):
+        B, T, _ = datas.shape
+        D = self.D
+
+        h_ini = torch.zeros((B,D), dtype=torch.double)
+        h_dyn_1 = torch.zeros((B,T-1,D), dtype=torch.double)
+        h_dyn_2 = torch.zeros((B,T-1,D), dtype=torch.double)
+    
+        h_obs = (1.0 / self.initial_variance) * self.model.emissions. \
+            invert(datas, input=inputs, mask=masks, tag=tags)
+
+        J_ini = torch.zeros((B, D, D), dtype=torch.double)
+        J_dyn_11 = torch.zeros((B, T - 1, D, D), dtype=torch.double)
+        J_dyn_21 = torch.zeros((B, T - 1, D, D), dtype=torch.double)
+        J_dyn_22 = torch.zeros((B, T - 1, D, D), dtype=torch.double)
+        J_obs = torch.tensor(np.tile(1 / self.initial_variance * np.eye(D)[None, None, :, :], (B, T, 1, 1)), dtype=torch.double)
+
+        return dict(J_ini=J_ini,
+                    h_ini=h_ini,
+                    J_dyn_11=J_dyn_11,
+                    J_dyn_21=J_dyn_21,
+                    J_dyn_22=J_dyn_22,
+                    h_dyn_1=h_dyn_1,
+                    h_dyn_2=h_dyn_2,
+                    J_obs=J_obs,
+                    h_obs=h_obs)      
 
     # Posterior expectations
     @property
@@ -379,12 +456,14 @@ class SLDSStructuredMeanFieldVariationalPosterior(VariationalPosterior):
     @property
     def mean_discrete_states(self):
         full_expectations = self.discrete_expectations
-        return [exp[0] for exp in full_expectations]
+        return full_expectations[0]
+        # return [exp[0] for exp in full_expectations]
 
     @property
     def mean_continuous_states(self):
         full_expectations = self.continuous_expectations
-        return [exp[1] for exp in full_expectations]
+        return full_expectations[1]
+        # return [exp[1] for exp in full_expectations]
 
     @property
     def mean(self):
@@ -392,15 +471,22 @@ class SLDSStructuredMeanFieldVariationalPosterior(VariationalPosterior):
 
     # Sample
     def sample_discrete_states(self):
-        return [hmm_sample(prms["pi0"], prms["Ps"], prms["log_likes"])
-                for prms in self._discrete_state_params]
+        prms = self._discrete_state_params
+        return hmm_sample_3d(prms['pi0'], prms['Ps'], prms['log_likes'])
+        # return [hmm_sample(prms["pi0"], prms["Ps"], prms["log_likes"])
+        #         for prms in self._discrete_state_params]
 
     def sample_continuous_states(self):
-        return [kalman_info_sample(prms["J_ini"], prms["h_ini"], 0,
+        prms = self._continuous_state_params
+        return kalman_info_sample_3d(prms["J_ini"], prms["h_ini"], torch.zeros((self.datas.shape[0], 1), dtype=torch.double),
                                    prms["J_dyn_11"], prms["J_dyn_21"], prms["J_dyn_22"],
-                                   prms["h_dyn_1"], prms["h_dyn_2"], 0,
-                                   prms["J_obs"], prms["h_obs"], 0)
-                for prms in self._continuous_state_params]
+                                   prms["h_dyn_1"], prms["h_dyn_2"], torch.zeros((self.datas.shape[0], 1), dtype=torch.double),
+                                   prms["J_obs"], prms["h_obs"], torch.zeros((self.datas.shape[0], 1), dtype=torch.double))
+        # return [kalman_info_sample(prms["J_ini"], prms["h_ini"], 0,
+        #                            prms["J_dyn_11"], prms["J_dyn_21"], prms["J_dyn_22"],
+        #                            prms["h_dyn_1"], prms["h_dyn_2"], 0,
+        #                            prms["J_obs"], prms["h_obs"], 0)
+        #         for prms in self._continuous_state_params]
 
     def sample(self):
         return list(zip(self.sample_discrete_states(), self.sample_continuous_states()))
@@ -408,9 +494,16 @@ class SLDSStructuredMeanFieldVariationalPosterior(VariationalPosterior):
     # Entropy
     def _discrete_entropy(self):
         negentropy = 0
-        discrete_expectations = self.discrete_expectations
-        for prms, (Ez, Ezzp1, normalizer) in \
-                zip(self.discrete_state_params, discrete_expectations):
+        # discrete_expectations = self.discrete_expectations
+        full_prms = self.discrete_state_params
+        Ezs, Ezzp1s, normalizers = self.discrete_expectations
+        # for prms, (Ez, Ezzp1, normalizer) in \
+        #         zip(self.discrete_state_params, discrete_expectations):
+        for i in range(Ezs.shape[0]):
+            Ez = Ezs[i].cpu().numpy()
+            Ezzp1 = Ezzp1s[i].cpu().numpy()
+            normalizer = normalizers[i].cpu().numpy()
+            prms = {key: val[i].cpu().numpy() for key, val in full_prms.items()}
 
             log_pi0 = np.log(prms["pi0"] + 1e-16) - logsumexp(prms["pi0"])
             log_Ps = np.log(prms["Ps"] + 1e-16) - logsumexp(prms["Ps"], axis=1, keepdims=True)
@@ -419,12 +512,40 @@ class SLDSStructuredMeanFieldVariationalPosterior(VariationalPosterior):
             negentropy += np.sum(Ez * prms["log_likes"])  # unitary factors
             negentropy += np.sum(Ezzp1 * log_Ps)  # pairwise factors
         return -negentropy
+    
+    def _discrete_entropy_3d(self):
+        negentropy = 0
+        prms = self.discrete_state_params
+        Ezs, Ezzp1s, normalizers = self.discrete_expectations
+        log_pi0 = torch.log(prms['pi0'] + 1e-16) - torch.logsumexp(prms['pi0'], dim=1, keepdim=True)
+        log_Ps = torch.log(prms['Ps'] + 1e-16) - torch.logsumexp(prms['Ps'], dim=2, keepdim=True)
+        negentropy -= torch.sum(normalizers)
+        negentropy += torch.sum(Ezs[:,0] * log_pi0)
+        negentropy += torch.sum(Ezs * prms['log_likes'])
+        negentropy += torch.sum(Ezzp1s * log_Ps)
+        # for i in range(Ez.shape[0]):
+        #     log_pi0 = torch.log(prms['pi0'][i] + 1e-16) - torch.logsumexp(prms['pi0'][i])
+        #     log_Ps = torch.log(prms['Ps'][i] + 1e-16) - torch.logsumexp(prms['Ps'][i], dim=1, keepdim=True)
+        #     negentropy -= normalizer[i]
+        #     negentropy += torch.sum(Ezs[i][0] * log_pi0)
+        #     negentropy += torch.sum(Ezs[i] * prms['log_likes'][i])
+        #     negentropy += torch.sum(Ezzp1s[i] * log_Ps)
+        return -negentropy
 
     def _continuous_entropy(self):
         negentropy = 0
-        continuous_expectations = self.continuous_expectations
-        for prms, (log_Z, Ex, smoothed_sigmas, ExxnT) in \
-                zip(self.continuous_state_params, continuous_expectations):
+        # continuous_expectations = self.continuous_expectations
+        full_prms = self.continuous_state_params
+        log_Zs, Exs, smoothed_sigmass, ExxnTs = self.continuous_expectations
+        # for prms, (log_Z, Ex, smoothed_sigmas, ExxnT) in \
+        #         zip(self.continuous_state_params, continuous_expectations):
+        for i in range(log_Zs.shape[0]):
+            # import pdb; pdb.set_trace()
+            Ex = Exs[i].cpu().numpy()
+            log_Z = log_Zs[i].cpu().numpy()[0]
+            smoothed_sigmas = smoothed_sigmass[i].cpu().numpy()
+            ExxnT = ExxnTs[i].cpu().numpy()
+            prms = {key: val[i].cpu().numpy() for key, val in full_prms.items()}
 
             # Kalman smoother outputs the smoothed covariance matrices. Add
             # back the mean to get E[x_t x_{t+1}^T]
@@ -447,6 +568,47 @@ class SLDSStructuredMeanFieldVariationalPosterior(VariationalPosterior):
             # Log normalizer
             negentropy -= log_Z
         return -negentropy
+    
+    def _continuous_entropy_3d(self):
+        negentropy = 0
+        prms = self.continuous_state_params
+        log_Zs, Exs, smoothed_sigmas, ExxnTs = self.continuous_expectations
+        mumuT = Exs[:,:,:,None] @ Exs[:,:,None,:]
+        ExxT = smoothed_sigmas + mumuT
+
+        negentropy += torch.sum(-0.5 * torch.sum(prms['J_ini'] * ExxT[:,0].permute(0,2,1), dim=(1,2)))
+        negentropy += torch.sum(-0.5 * torch.sum(prms['J_dyn_11'] * ExxT[:,:-1].permute(0,1,3,2), dim=(2,3)))
+        negentropy += torch.sum(-0.5 * torch.sum(prms['J_dyn_22'] * ExxT[:,1:].permute(0,1,3,2), dim=(2,3)))
+        negentropy += torch.sum(-0.5 * torch.sum(prms['J_obs'] * ExxT.permute(0,1,3,2), dim=(2,3)))
+        negentropy += torch.sum(-1.0 * torch.sum(prms['J_dyn_21'] * ExxnTs.permute(0,1,3,2), dim=(2,3)))
+
+        negentropy += torch.sum(prms['h_ini'] * Exs[:,0])
+        negentropy += torch.sum(prms['h_dyn_1'] * Exs[:,:-1])
+        negentropy += torch.sum(prms['h_dyn_2'] * Exs[:,1:])
+        negentropy += torch.sum(prms['h_obs'] * Exs)
+
+        negentropy -= torch.sum(log_Zs)
+
+        return -negentropy
+        # for i in range(log_Z.shape[0]):
+        #     mumuT = Exs[i][:, None].permute(0, 2, 1) @ Exs[i][:, None]
+        #     ExxT = smoothed_sigmas[i] + mumuT
+
+        #     # Pairwise terms
+        #     negentropy += np.sum(-0.5 * trace_product(prms["J_ini"], ExxT[0]))
+        #     negentropy += np.sum(-0.5 * trace_product(prms["J_dyn_11"], ExxT[:-1]))
+        #     negentropy += np.sum(-0.5 * trace_product(prms["J_dyn_22"], ExxT[1:]))
+        #     negentropy += np.sum(-0.5 * trace_product(prms["J_obs"], ExxT))
+        #     negentropy += np.sum(-1.0 * trace_product(prms["J_dyn_21"], ExxnT))
+
+        #     # Unary terms
+        #     negentropy += np.sum(prms["h_ini"] * Ex[0])
+        #     negentropy += np.sum(prms["h_dyn_1"] * Ex[:-1])
+        #     negentropy += np.sum(prms["h_dyn_2"] * Ex[1:])
+        #     negentropy += np.sum(prms["h_obs"] * Ex)
+
+        #     # Log normalizer
+        #     negentropy -= log_Z
 
     def entropy(self):
         """
@@ -472,6 +634,9 @@ class SLDSStructuredMeanFieldVariationalPosterior(VariationalPosterior):
         normalizer of the distribution.
 
         """
-        continuous_entropy = self._continuous_entropy()
-        discrete_entropy = self._discrete_entropy()
+        # continuous_entropy = self._continuous_entropy()
+        # discrete_entropy = self._discrete_entropy()
+        continuous_entropy = self._continuous_entropy_3d()
+        discrete_entropy = self._discrete_entropy_3d()
+        # import pdb; pdb.set_trace()
         return discrete_entropy + continuous_entropy
